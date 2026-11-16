@@ -14,7 +14,7 @@ magic, rate, channels, frames = struct.unpack_from('<8sIII', raw)
 assert magic == b'DNPA0001' and rate == 32000 and channels == 2 and frames == 192000
 pcm = raw[20:]
 assert len(pcm) == frames * channels * 2
-packed = zlib.compress(pcm, 9)
+packed = zlib.compress(pcm, 9, wbits=-15)  # raw deflate: zlib_inflate_blob expects no wrapper
 lines = ['/* Generated from local game assets; do not redistribute without rights. */',
          '#define DNPR_AUDIO_RATE 32000U',
          f'#define DNPR_AUDIO_BYTES {len(pcm)}U',

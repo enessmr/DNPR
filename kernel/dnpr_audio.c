@@ -143,21 +143,31 @@ static int __init dnpr_hda_init(void)
 	if (!dnpr_hda_pci)
 		return 0;
 	dnpr_hda_regs = pci_iomap(dnpr_hda_pci, 0, 0);
-	if (!dnpr_hda_regs)
+	if (!dnpr_hda_regs) {
+		pr_warn("DNPR: HDA BAR 0 map failed\n");
 		goto fail;
+	}
 	gcap = readw(dnpr_hda_regs + AZX_REG_GCAP);
 	dnpr_hda_stream_index = (gcap & AZX_GCAP_ISS) >> 8;
 	if (!((gcap & AZX_GCAP_OSS) >> 12) ||
-	    dnpr_hda_stream_index > 14 || DNPR_HDA_ENTRIES > 256)
+	    dnpr_hda_stream_index > 14 || DNPR_HDA_ENTRIES > 256) {
+		pr_warn("DNPR: HDA GCAP %#x not usable for panic PCM\n", gcap);
 		goto fail;
+	}
 	dnpr_hda_bdl = dma_alloc_coherent(&dnpr_hda_pci->dev,
 					 sizeof(*dnpr_hda_bdl) * DNPR_HDA_ENTRIES,
 					 &dnpr_hda_bdl_dma, GFP_KERNEL);
 	decoded = vmalloc(DNPR_AUDIO_BYTES);
-	if (!decoded || !dnpr_hda_bdl ||
-	    zlib_inflate_blob(decoded, DNPR_AUDIO_BYTES,
-			      dnpr_audio_deflate, sizeof(dnpr_audio_deflate)) != DNPR_AUDIO_BYTES)
+	if (!dnpr_hda_bdl || !decoded) {
+		pr_warn("DNPR: HDA PCM allocation failed\n");
 		goto fail;
+	}
+	if (zlib_inflate_blob(decoded, DNPR_AUDIO_BYTES,
+			      dnpr_audio_deflate,
+			      sizeof(dnpr_audio_deflate)) != DNPR_AUDIO_BYTES) {
+		pr_warn("DNPR: HDA PCM decode failed\n");
+		goto fail;
+	}
 	for (i = 0; i < DNPR_HDA_ENTRIES; i++) {
 		unsigned int length = min_t(unsigned int, DNPR_HDA_CHUNK,
 						   DNPR_AUDIO_BYTES - i * DNPR_HDA_CHUNK);
