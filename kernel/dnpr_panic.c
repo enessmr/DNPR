@@ -39,6 +39,8 @@
 #define DNPR_HEIGHT 1080U
 #define DNPR_MAX_WIDTH 4096U
 #define DNPR_MAX_HEIGHT 2160U
+#define DNPR_FASTEST_FRAME_NS 6944444ULL /* 144 Hz ceiling */
+#define DNPR_AMBIENT_FRAME_NS 83333333ULL /* 12 fps texture clock */
 
 #define DNPR_BASE_BYTES ((size_t)DNPR_WIDTH * DNPR_HEIGHT * 2U)
 #define DNPR_SPRITE 128U
@@ -104,7 +106,7 @@ struct dnpr_rect {
 static u8 *dnpr_live_data;
 static u16 *dnpr_live_depth;
 static struct dnpr_projected dnpr_projected[DNPR_LIVE_NV];
-static unsigned int dnpr_last_pose = ~0U;
+static u64 dnpr_last_pose_q = ~0ULL;
 static struct {
 	int x0, y0, x1, y1;
 } dnpr_head_bounds, dnpr_head_dirty;
@@ -187,33 +189,49 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 	}
 }
 
+static s32 dnpr_lerp_s32(s32 a, s32 b, unsigned int fraction)
+{
+	return a + ((s64)(b - a) * fraction >> 16);
+}
+
 static bool dnpr_render_live_head(unsigned int elapsed_ms)
 {
 	const struct dnpr_live_triangle *tris;
-	const struct dnpr_live_vertex *verts;
-	unsigned int pose = min_t(u64, (u64)elapsed_ms * 30 / 1000,
-				  DNPR_LIVE_NF - 1), i;
+	const struct dnpr_live_vertex *verts, *next_verts;
+	u64 pose_q = min_t(u64, (u64)elapsed_ms * 30 * 65536 / 1000,
+			   (u64)(DNPR_LIVE_NF - 1) << 16);
+	unsigned int pose = pose_q >> 16, fraction = pose_q & 0xffff, i;
 	int x0 = DNPR_WIDTH, y0 = DNPR_HEIGHT, x1 = 0, y1 = 0;
 
-	if (pose == dnpr_last_pose)
+	if (pose_q == dnpr_last_pose_q)
 		return false;
-	dnpr_last_pose = pose;
+	dnpr_last_pose_q = pose_q;
 	memcpy(dnpr_base, dnpr_live_data, DNPR_BASE_BYTES);
 	memset(dnpr_live_depth, 0xff, DNPR_BASE_BYTES);
 	tris = (const void *)(dnpr_live_data + DNPR_BASE_BYTES);
 	verts = (const void *)(dnpr_live_data + DNPR_BASE_BYTES +
 		DNPR_LIVE_NT * sizeof(*tris) + pose * DNPR_LIVE_NV * sizeof(*verts));
+	next_verts = (const void *)(dnpr_live_data + DNPR_BASE_BYTES +
+		DNPR_LIVE_NT * sizeof(*tris) +
+		min(pose + 1, DNPR_LIVE_NF - 1) * DNPR_LIVE_NV * sizeof(*verts));
 	for (i = 0; i < DNPR_LIVE_NV; i++) {
-		int cam_z = 20 * 256 - verts[i].z;
+		s32 vx = dnpr_lerp_s32(verts[i].x, next_verts[i].x, fraction);
+		s32 vy = dnpr_lerp_s32(verts[i].y, next_verts[i].y, fraction);
+		s32 vz = dnpr_lerp_s32(verts[i].z, next_verts[i].z, fraction);
+		int cam_z = 20 * 256 - vz;
 
 		if (cam_z <= 0)
 			cam_z = 1;
 		dnpr_projected[i] = (struct dnpr_projected){
-			.x = DNPR_WIDTH / 2 + div_s64((s64)verts[i].x * 1365, cam_z),
-			.y = DNPR_HEIGHT / 2 - div_s64((s64)(verts[i].y - 2 * 256) * 1365, cam_z),
+			.x = DNPR_WIDTH / 2 + div_s64((s64)vx * 1365, cam_z),
+			.y = DNPR_HEIGHT / 2 - div_s64((s64)(vy - 2 * 256) * 1365, cam_z),
 			.z = cam_z,
-			.lr = verts[i].lr, .lg = verts[i].lg, .lb = verts[i].lb,
-			.nx = verts[i].nx, .ny = verts[i].ny, .nz = verts[i].nz,
+			.lr = dnpr_lerp_s32(verts[i].lr, next_verts[i].lr, fraction),
+			.lg = dnpr_lerp_s32(verts[i].lg, next_verts[i].lg, fraction),
+			.lb = dnpr_lerp_s32(verts[i].lb, next_verts[i].lb, fraction),
+			.nx = dnpr_lerp_s32(verts[i].nx, next_verts[i].nx, fraction),
+			.ny = dnpr_lerp_s32(verts[i].ny, next_verts[i].ny, fraction),
+			.nz = dnpr_lerp_s32(verts[i].nz, next_verts[i].nz, fraction),
 		};
 		x0 = min(x0, dnpr_projected[i].x);
 		y0 = min(y0, dnpr_projected[i].y);
@@ -613,8 +631,13 @@ void dnpr_panic_animate(void)
 
 	if (!READ_ONCE(dnpr_sb_count))
 		return;
+	for (k = 0; k < dnpr_sb_count; k++)
+		if (READ_ONCE(dnpr_sb_valid[k]) &&
+		    dnpr_sb[k].width == DNPR_WIDTH &&
+		    dnpr_sb[k].height == DNPR_HEIGHT)
+			native_scanout = true;
 	start_ns = ktime_get_mono_fast_ns();
-	next_ns = start_ns + 33333333ULL;
+	next_ns = start_ns + DNPR_FASTEST_FRAME_NS;
 	dnpr_audio_start();
 	for (;;) {
 		now_ns = ktime_get_mono_fast_ns();
@@ -626,17 +649,14 @@ void dnpr_panic_animate(void)
 				udelay(wait_us % 1000);
 		}
 		now_ns = ktime_get_mono_fast_ns();
-		next_ns = now_ns + 33333333ULL;
 		elapsed_ms = min_t(u64,
 			(now_ns - start_ns) / 1000000,
 			~0U);
+		next_ns = now_ns +
+			(elapsed_ms < DIV_ROUND_UP((DNPR_LIVE_NF - 1) * 1000, 30) ?
+			 DNPR_FASTEST_FRAME_NS : DNPR_AMBIENT_FRAME_NS);
 		dnpr_frame++;
 		head_changed = dnpr_render_live_head(elapsed_ms);
-		for (k = 0; k < dnpr_sb_count; k++)
-			if (READ_ONCE(dnpr_sb_valid[k]) &&
-			    dnpr_sb[k].width == DNPR_WIDTH &&
-			    dnpr_sb[k].height == DNPR_HEIGHT)
-				native_scanout = true;
 		if (native_scanout && dnpr_shared_frame)
 			dnpr_render_shared(elapsed_ms, dnpr_frame, false,
 					   head_changed);
