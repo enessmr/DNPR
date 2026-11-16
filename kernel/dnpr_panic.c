@@ -7,10 +7,8 @@
  * are rasterized with a depth buffer on each head frame. Sprite layers
  * contain both stars, both sparkle sets, and prompt glyphs.
  *
- * Nothing animates before a panic. The first panic draw renders frame 0
- * and installs a panic_blink handler; from then on the panic loop calls
- * it about every 200 ms and the handler composites the next live frame
- * straight into every already-mapped scanout buffer.
+ * Nothing animates before a panic. The DRM dumper collects all scanouts,
+ * then one shared panic loop redraws them from one clock.
  * Redraws allocate nothing, use no floating point, and end with the
  * same write barrier the driver's panic_flush uses.
  */
@@ -19,11 +17,11 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/iosys-map.h>
+#include <linux/ktime.h>
 #include <linux/math.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
-#include <linux/panic.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -180,11 +178,12 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 	}
 }
 
-static void dnpr_render_live_head(unsigned int tick)
+static void dnpr_render_live_head(unsigned int elapsed_ms)
 {
 	const struct dnpr_live_triangle *tris;
 	const struct dnpr_live_vertex *verts;
-	unsigned int pose = min(tick * 6, DNPR_LIVE_NF - 1), i;
+	unsigned int pose = min_t(u64, (u64)elapsed_ms * 30 / 1000,
+				  DNPR_LIVE_NF - 1), i;
 
 	if (pose == dnpr_last_pose)
 		return;
@@ -229,8 +228,7 @@ static void dnpr_render_live_head(unsigned int tick)
 static struct drm_scanout_buffer dnpr_sb[DNPR_MAX_SB];
 static bool dnpr_sb_valid[DNPR_MAX_SB];
 static unsigned int dnpr_sb_count;
-static unsigned int dnpr_tick;
-static long (*dnpr_blink_prev)(int state);
+static unsigned int dnpr_frame;
 
 static void dnpr_sample_base(unsigned int x, unsigned int y, unsigned int width,
 			     unsigned int height, unsigned int *r,
@@ -315,12 +313,10 @@ static void dnpr_red_block(struct dnpr_sprite *out, unsigned int *n,
 }
 
 /*
- * One live frame: same layer list, offsets, sizes, and draw order as the
- * preview's star_with_particles and draw_prompt. The blink loop runs at
- * roughly 5 fps, so the kernel advances each channel one frame per tick
- * instead of replaying the 30/12 fps preview clocks.
+ * One live frame: star and sparkle textures advance on a 12 fps clock;
+ * the prompt changes visibility every 15 frames of the 30 fps game clock.
  */
-static unsigned int dnpr_place_sprites(unsigned int tick, unsigned int width,
+static unsigned int dnpr_place_sprites(unsigned int elapsed_ms, unsigned int width,
 				       unsigned int height,
 				       struct dnpr_sprite *out)
 {
@@ -330,16 +326,17 @@ static unsigned int dnpr_place_sprites(unsigned int tick, unsigned int width,
 	const u8 *sparkle = dnpr_layers + DNPR_SPARKLE_OFF;
 	const u8 *red_sparkle = dnpr_layers + DNPR_RED_SPARKLE_OFF;
 	const u8 *glyph = dnpr_layers + DNPR_GLYPH_OFF;
+	unsigned int sprite_tick = (u64)elapsed_ms * 12 / 1000;
 
-	dnpr_silver_block(out, &n, star, sparkle, (tick + 1) % DNPR_STAR_FRAMES,
-			  (tick + 4) % DNPR_SPARKLE_FRAMES,
+	dnpr_silver_block(out, &n, star, sparkle, (sprite_tick + 1) % DNPR_STAR_FRAMES,
+			  (sprite_tick + 4) % DNPR_SPARKLE_FRAMES,
 			  width * 21 / 100, height * 97 / 100, star_size);
-	dnpr_red_block(out, &n, red_star, red_sparkle, (tick + 5) % DNPR_STAR_FRAMES,
-		       (tick + 2) % DNPR_SPARKLE_FRAMES,
+	dnpr_red_block(out, &n, red_star, red_sparkle, (sprite_tick + 5) % DNPR_STAR_FRAMES,
+		       (sprite_tick + 2) % DNPR_SPARKLE_FRAMES,
 		       width * 92 / 100, height * 16 / 100, star_size / 2);
 
-	/* Flickering reboot prompt: on about 68% of each 0.85 s cycle. */
-	if ((tick * 20) % 85 < 58) {
+	/* 15 SM64 frames = 500 ms at the original 30 fps. */
+	if (!((elapsed_ms / 500) & 1)) {
 		static const char *const lines[3] = { "REBOOT", "YOUR", "DEVICE" };
 		unsigned int line, size = height / 21;
 		int advance = size * 5 / 6;
@@ -363,23 +360,20 @@ static unsigned int dnpr_place_sprites(unsigned int tick, unsigned int width,
 	return n;
 }
 
-static void dnpr_composite(struct drm_scanout_buffer *sb, unsigned int tick)
+static void dnpr_composite_rect(struct drm_scanout_buffer *sb,
+				const struct dnpr_sprite *sprites, unsigned int n,
+				unsigned int frame, unsigned int x0,
+				unsigned int y0, unsigned int x1,
+				unsigned int y1)
 {
-	dnpr_render_live_head(tick);
-	struct dnpr_sprite sprites[DNPR_MAX_SPRITES];
-	unsigned int n = dnpr_place_sprites(tick, sb->width, sb->height,
-					    sprites);
 	unsigned int width = sb->width, height = sb->height;
 	unsigned int cpp = sb->format->cpp[0];
 	void (*set_pixel)(struct drm_scanout_buffer *, unsigned int, unsigned int,
 			  u32) = sb->set_pixel;
-	/* Diagnostic frame counter: 8 px wide at frame 0, then grows by
-	 * 8 px per redraw. Keep this visible while testing panic animation.
-	 */
-	unsigned int bar_w = ((tick % 40) + 1) * 8;
+	unsigned int bar_w = ((frame % 40) + 1) * 8;
 	unsigned int x, y;
 
-	for (y = 0; y < height; y++) {
+	for (y = y0; y < min(y1, height); y++) {
 		const struct dnpr_sprite *active[DNPR_MAX_SPRITES];
 		unsigned int row_n = 0, i;
 
@@ -387,7 +381,7 @@ static void dnpr_composite(struct drm_scanout_buffer *sb, unsigned int tick)
 			if (y >= sprites[i].top && y < sprites[i].top + sprites[i].size)
 				active[row_n++] = &sprites[i];
 
-		for (x = 0; x < width; x++) {
+		for (x = x0; x < min(x1, width); x++) {
 			unsigned int r, g, b;
 			u32 rgb, color;
 
@@ -408,9 +402,35 @@ static void dnpr_composite(struct drm_scanout_buffer *sb, unsigned int tick)
 				memcpy(dnpr_row + x * cpp, &color, cpp);
 		}
 		if (!set_pixel)
-			iosys_map_memcpy_to(&sb->map[0], (size_t)y * sb->pitch[0],
-					    dnpr_row, width * cpp);
+			iosys_map_memcpy_to(&sb->map[0],
+					    (size_t)y * sb->pitch[0] + x0 * cpp,
+					    dnpr_row + x0 * cpp,
+					    (min(x1, width) - x0) * cpp);
 	}
+}
+
+static void dnpr_composite(struct drm_scanout_buffer *sb,
+			   unsigned int elapsed_ms, unsigned int frame)
+{
+	struct dnpr_sprite sprites[DNPR_MAX_SPRITES];
+	unsigned int n;
+	unsigned int width = sb->width, height = sb->height;
+
+	dnpr_render_live_head(elapsed_ms);
+	n = dnpr_place_sprites(elapsed_ms, width, height, sprites);
+	if (elapsed_ms <= 4500) {
+		dnpr_composite_rect(sb, sprites, n, frame, 0, 0, width, height);
+		return;
+	}
+	/* Once Mario reaches the sigh pose, only these overlay regions change.
+	 * Rebuild them from the cached base instead of rewriting both screens.
+	 */
+	dnpr_composite_rect(sb, sprites, n, frame, 0, height * 70 / 100,
+			    width / 2, height);
+	dnpr_composite_rect(sb, sprites, n, frame, width * 80 / 100, 0,
+			    width, height * 30 / 100);
+	dnpr_composite_rect(sb, sprites, n, frame, 0, 0,
+			    min(width, 320U), min(height, 4U));
 }
 
 static bool dnpr_scanout_ok(struct drm_scanout_buffer *sb)
@@ -428,47 +448,15 @@ static bool dnpr_scanout_ok(struct drm_scanout_buffer *sb)
 	return true;
 }
 
-/* Called from the panic loop every ~3600 / PANIC_BLINK_SPD ms. */
-static long dnpr_panic_blink(int state)
-{
-	unsigned int k, tick;
-
-	if (dnpr_blink_prev)
-		dnpr_blink_prev(state);
-	if (!READ_ONCE(dnpr_sb_count))
-		return 0;
-	tick = READ_ONCE(dnpr_tick) + 1;
-	WRITE_ONCE(dnpr_tick, tick);
-	dnpr_audio_maybe_stop();
-	for (k = 0; k < dnpr_sb_count; k++)
-		if (READ_ONCE(dnpr_sb_valid[k]))
-			dnpr_composite(&dnpr_sb[k], tick);
-	/* Same barrier the driver's panic_flush applies after a draw. */
-	wmb();
-	return 0; /* keep the panic loop's ~200 ms cadence */
-}
-
-static void dnpr_install_blink(void)
-{
-	if (dnpr_blink_prev == dnpr_panic_blink)
-		return;
-	dnpr_blink_prev = panic_blink;
-	WRITE_ONCE(panic_blink, dnpr_panic_blink);
-}
-
 bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 {
-	unsigned int idx, frame;
+	unsigned int idx;
 
 	if (!READ_ONCE(dnpr_ready) || !dnpr_scanout_ok(sb))
 		return false;
 
-	/* Other CPUs are already stopped when the panic dumper runs, and no
-	 * allocation happens after this point: snapshot the scanout buffer
-	 * for the blink handler, draw frame 0, then hand the loop a blink
-	 * that keeps the scene live. Every plane reporting a scanout buffer
-	 * gets its own snapshot, and blink redraws all of them, since we
-	 * cannot tell which scanout is actually visible.
+	/* The DRM dumper calls this for every plane before starting the shared
+	 * animation loop. Keep the scanout mapping and display its first frame.
 	 */
 	if (dnpr_sb_count < DNPR_MAX_SB)
 		idx = dnpr_sb_count++;
@@ -476,25 +464,32 @@ bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 		idx = DNPR_MAX_SB - 1;
 	dnpr_sb[idx] = *sb;
 	WRITE_ONCE(dnpr_sb_valid[idx], true);
-	WRITE_ONCE(dnpr_tick, 0);
-	dnpr_composite(&dnpr_sb[idx], 0);
+	dnpr_composite(&dnpr_sb[idx], 0, 0);
 	wmb();
+	return true;
+}
+
+void dnpr_panic_animate(void)
+{
+	u64 start_ns;
+	unsigned int k, elapsed_ms;
+
+	if (!READ_ONCE(dnpr_sb_count))
+		return;
+	start_ns = ktime_get_mono_fast_ns();
 	dnpr_audio_start();
-	/* The DRM kmsg dumper can display its first frame and then never reach
-	 * panic()'s later blink loop on this NVIDIA system. Play the finite
-	 * sequence here, while this scanout mapping is known to be valid. This
-	 * is a real redraw of the posed 3D mesh on every iteration, not a
-	 * pre-rendered frame sequence. Keep the final sigh pose on screen.
-	 */
-	for (frame = 1; frame <= 30; frame++) {
-		mdelay(200);
-		dnpr_composite(&dnpr_sb[idx], frame);
+	for (;;) {
+		mdelay(80);
+		elapsed_ms = min_t(u64,
+			(ktime_get_mono_fast_ns() - start_ns) / 1000000,
+			~0U);
+		dnpr_frame++;
+		for (k = 0; k < dnpr_sb_count; k++)
+			if (READ_ONCE(dnpr_sb_valid[k]))
+				dnpr_composite(&dnpr_sb[k], elapsed_ms, dnpr_frame);
 		wmb();
 		dnpr_audio_maybe_stop();
 	}
-	WRITE_ONCE(dnpr_tick, frame - 1);
-	dnpr_install_blink();
-	return true;
 }
 
 int __init dnpr_panic_init(void)
@@ -546,6 +541,7 @@ void dnpr_panic_exit(void)
 {
 	WRITE_ONCE(dnpr_ready, false);
 	dnpr_sb_count = 0;
+	dnpr_frame = 0;
 	vfree(dnpr_live_depth);
 	dnpr_live_depth = NULL;
 	vfree(dnpr_live_data);
@@ -559,4 +555,4 @@ void dnpr_panic_exit(void)
 }
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("DNPR preloaded DRM panic scene with live blink animation");
+MODULE_DESCRIPTION("DNPR preloaded DRM panic scene with shared live animation");

@@ -1,6 +1,6 @@
 --- a/drivers/gpu/drm/Kconfig
 +++ b/drivers/gpu/drm/Kconfig
-@@ -120,6 +120,15 @@
+@@ -120,6 +120,17 @@
  	  To support Hi-DPI Display, you can enable bigger fonts like
  	  FONT_TER16x32
  
@@ -10,15 +10,15 @@
 +	select ZLIB_INFLATE
 +	help
 +	  Draw a preloaded DNPR scene through the driver panic scanout
-+	  hook: frame 0 at the first panic draw, then the star, sparkle,
-+	  and prompt animation composited live by the panic loop's blink
-+	  callback. This only works with a driver that implements
++	  hook: all scanouts are collected first, then Mario plays once while
++	  stars, particles, and prompt continue on a shared clock. This only
++	  works with a driver that implements
 +	  get_scanout_buffer; it does not add that hook to a driver.
 +
  config DRM_PANIC_FOREGROUND_COLOR
  	hex "Drm panic screen foreground color, in RGB"
  	depends on DRM_PANIC
-@@ -141,6 +150,7 @@
+@@ -141,6 +152,7 @@
  
  config DRM_PANIC_SCREEN
  	string "Panic screen formatter"
@@ -59,7 +59,40 @@
  	if (!strcmp(drm_panic_screen, "kmsg")) {
  		draw_panic_static_kmsg(sb);
  	} else if (!strcmp(drm_panic_screen, "qr_code")) {
-@@ -847,6 +854,10 @@
+@@ -737,9 +744,30 @@ static struct drm_plane *to_drm_plane(struct kmsg_dumper *kd)
+ static void drm_panic(struct kmsg_dumper *dumper, struct kmsg_dump_detail *detail)
+ {
+ 	struct drm_plane *plane = to_drm_plane(dumper);
++#ifdef CONFIG_DRM_DNPR
++	static bool dnpr_started;
++	struct drm_plane *other;
++#endif
+ 
+-	if (detail->reason == KMSG_DUMP_PANIC)
+-		draw_panic_plane(plane, detail->description);
++	if (detail->reason != KMSG_DUMP_PANIC)
++		return;
++#ifdef CONFIG_DRM_DNPR
++	if (!strcmp(drm_panic_screen, "dnpr")) {
++		if (dnpr_started)
++			return;
++		dnpr_started = true;
++		/* All plane dumpers for this device share one clock. Collect each
++		 * scanout before the animation loop, including the second monitor.
++		 */
++		drm_for_each_plane(other, plane->dev)
++			if (other->helper_private &&
++			    other->helper_private->get_scanout_buffer)
++				draw_panic_plane(other, detail->description);
++		dnpr_panic_animate();
++		return;
++	}
++#endif
++	draw_panic_plane(plane, detail->description);
+ }
+ 
+ /**
+@@ -847,5 +875,9 @@
  void __init drm_panic_init(void)
  {
  	drm_panic_qr_init();
@@ -69,8 +102,7 @@
 +#endif
  }
  
- /**
-@@ -854,5 +865,8 @@
+@@ -854,5 +886,8 @@
   */
  void drm_panic_exit(void)
  {

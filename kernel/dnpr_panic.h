@@ -7,6 +7,7 @@
 struct drm_scanout_buffer;
 
 bool dnpr_panic_render(struct drm_scanout_buffer *sb);
+void dnpr_panic_animate(void);
 int dnpr_panic_init(void);
 void dnpr_panic_exit(void);
 
