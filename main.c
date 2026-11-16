@@ -56,7 +56,8 @@ static int clampi(int v){return v<0?0:v>255?255:v;}
 
 static Vec3 head_frames[131][MAX_VERT];
 static Vec3 star_positions[131][2];
-static int head_frame=-1;
+static int head_frame=-1,head_next=-1;
+static float head_frac=-1;
 static int selected_frame=-1;
 
 static bool load_head(void){
@@ -148,11 +149,15 @@ static bool init_buffers(int width,int height){
     return true;
 }
 
-static void pose_head(int frame){
-    if(frame==head_frame)return;
-    head_frame=frame;
+static void pose_head(int frame,int next,float frac){
+    if(next>130)next=130;
+    if(next<frame)next=frame;
+    if(frame==head_frame&&next==head_next&&frac==head_frac)return;
+    head_frame=frame;head_next=next;head_frac=frac;
     for(int i=0;i<mesh.nv;i++){
-        mesh.v[i].p=head_frames[frame][i];mesh.v[i].n=v3(0,0,0);
+        Vec3 a=head_frames[frame][i],b=head_frames[next][i];
+        mesh.v[i].p=v3(a.x+(b.x-a.x)*frac,a.y+(b.y-a.y)*frac,a.z+(b.z-a.z)*frac);
+        mesh.v[i].n=v3(0,0,0);
         mesh.v[i].r=mesh.v[i].g=mesh.v[i].b=255;
     }
     for(int i=0;i<mesh.nt;i++){
@@ -383,16 +388,17 @@ static void star_with_particles(int image,int cx,int cy,int size,float seconds,b
 
 static void frame(double seconds,bool static_frame,bool animation_only,bool overlays){
     static bool final_cached=false;
-    float t=static_frame?130.f/30.f:(float)seconds;
-    int frame_index=selected_frame>=0?selected_frame:(static_frame?130:(int)(t*30));
-    if(frame_index>130)frame_index=130;
+    float pose=selected_frame>=0?(float)selected_frame:(static_frame?130.f:(float)seconds*30.f);
+    if(pose>130.f)pose=130.f;
+    int frame_index=(int)pose;
+    float pose_frac=pose-(float)frame_index;
     if(frame_index==130&&final_cached){
         memcpy(pixels,final_head_cache,(size_t)W*H*sizeof(*pixels));
     }else{
         if(animation_only)memset(pixels,0,(size_t)W*H*sizeof(*pixels));
         else memcpy(pixels,background,(size_t)W*H*sizeof(*pixels));
         memset(depth,0,(size_t)W*H*sizeof(*depth));
-        pose_head(frame_index);
+        pose_head(frame_index,frame_index<130?frame_index+1:130,pose_frac);
         Projected p[MAX_VERT];
         for(int i=0;i<mesh.nv;i++)p[i]=project(mesh.v[i]);
         raster_draw(p);
@@ -590,7 +596,7 @@ int main(int argc,char **argv){
         frame(sec,static_frame,animation_only,true);
         SDL_UpdateTexture(texture,NULL,pixels,W*sizeof(uint32_t));
         SDL_RenderClear(renderer);SDL_RenderCopy(renderer,texture,NULL,NULL);SDL_RenderPresent(renderer);
-        SDL_Delay(8);
+        SDL_Delay(1);
     }
     if(audio)SDL_CloseAudioDevice(audio);
     raster_shutdown();
