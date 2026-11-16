@@ -28,3 +28,4 @@ kernel/.module-common.o
 
 __pycache__/
 *.pyc
+.dnpr*

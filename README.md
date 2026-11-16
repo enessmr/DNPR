@@ -21,7 +21,7 @@ Audio is on by default; `--no-audio` disables it. Escape also exits. `--render-f
 
 The background keeps its stretched 16:9 tile geometry and repeats additional tiles on wider screens. Sparkles use 128×128 HD frames at 720p and above and 32×32 SD frames below 720p.
 
-The preview uses SDL's compositor-managed fullscreen desktop window. Hyprland retains DRM master and the display mode. Closing the window restores the prior desktop state without changing connector routing. The control socket lives at `$XDG_RUNTIME_DIR/dnpr-test-UID.sock`; a stale socket is replaced only after a failed connection. A process crash closes its Wayland window, so it cannot retain display ownership.
+The preview uses SDL's compositor-managed fullscreen desktop window. Hyprland retains DRM master and the display mode. Closing the window restores the prior desktop state without changing connector routing. The control socket lives at `$XDG_RUNTIME_DIR/dnpr-test-UID.sock`; a stale socket is replaced only after a failed connection. A process crash closes its Wayland window, so it cannot retain display ownership. Rasterization runs on persistent worker threads created once at startup; each frame the workers and the calling thread grab 32-row bands from an atomic queue, so rows never straddle threads and the depth buffer needs no locking. Threads are only used in the SDL preview; the panic renderer still draws on one CPU.
 
 ## Verified on this system
 
@@ -31,7 +31,7 @@ The preview uses SDL's compositor-managed fullscreen desktop window. Hyprland re
 - SDL enumerated and identified both displays. Hyprland reported the DNPR fullscreen window on monitor 0 (Acer), workspace 2.
 - Static preview, animation, audio, status, and stop completed. PipeWire showed a 32 kHz stereo playback stream. A comparison against music-only capture confirmed Mario's voice signal from about 0.5 to 1.5 seconds. The audio ends at 6 seconds with a quarter-second fade over the natural break. The rebuilt audio preview ran on Acer monitor 0 and stopped cleanly. After exit, no DNPR window remained, and both displays retained their modes and workspaces.
 - Native-resolution frame generation and build completed without warnings.
-- At 1920×1080, a local render benchmark measured about 15.5 ms per changing head pose and 1.1 ms per frozen frame after caching the completed head image. A separate 640×360 render verified the low-resolution atlas path.
+- At 1920×1080, a local render benchmark measured about 23.5 ms per changing head pose on one thread. The rasterizer now splits the frame into 32-row bands pulled from an atomic queue by persistent worker threads plus the calling thread, one worker per logical CPU up to 15. On this machine (6 cores, Hyper-Threading, 12 hardware threads) that measures about 5.0 ms per changing pose, a 4.7× speedup, and the 1.1 ms frozen-frame path after caching the completed head image is unchanged. Renders at poses 0, 60, and 130 are bit-identical to the single-threaded build because each row is rasterized exactly once with the same math. A separate 640×360 render verified the low-resolution atlas path.
 - The preview reads 644 posed 3D vertices and rasterizes 1,213 triangles per frame, with a depth buffer and live SDL audio. Headless renders of poses 0 and 60 have different hashes. This verifies the preview path; it does not verify a kernel panic.
 
 ## Kernel panic backend

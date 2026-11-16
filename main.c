@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <glob.h>
 #include <math.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +31,16 @@ typedef struct { float x,y,z,invz,lr,lg,lb,nx,ny,nz; } Projected;
 static Mesh mesh;
 static uint32_t *pixels,*background,*final_head_cache;
 static float *depth;
+static pthread_t raster_workers[15];
+static pthread_mutex_t raster_lock=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t raster_start=PTHREAD_COND_INITIALIZER;
+static pthread_cond_t raster_done=PTHREAD_COND_INITIALIZER;
+static const Projected *raster_vertices;
+static atomic_int raster_next_band;
+static int raster_band_count;
+static unsigned raster_generation,raster_completed;
+static bool raster_stop;
+static int raster_worker_count;
 static uint8_t *background_rows,*star_images,*prompt_images,*prompt_images_hd,*sparkle_images,*sparkle_images_hd;
 static volatile sig_atomic_t running=1;
 static int server_fd=-1;
@@ -171,15 +183,15 @@ static Projected project(Vertex v){
 }
 
 static float edge(float ax,float ay,float bx,float by,float x,float y){return (x-ax)*(by-ay)-(y-ay)*(bx-ax);}
-static void draw_tri(Projected a,Projected b,Projected c,Tri tri){
+static void draw_tri(Projected a,Projected b,Projected c,Tri tri,int band_y0,int band_y1){
     if(a.z<=.05f||b.z<=.05f||c.z<=.05f)return;
     float area=edge(a.x,a.y,b.x,b.y,c.x,c.y);
     if(fabsf(area)<.01f)return;
     float inv_area=1.f/area;
     int x0=(int)fmaxf(0,floorf(fminf(a.x,fminf(b.x,c.x))));
     int x1=(int)fminf(W-1,ceilf(fmaxf(a.x,fmaxf(b.x,c.x))));
-    int y0=(int)fmaxf(0,floorf(fminf(a.y,fminf(b.y,c.y))));
-    int y1=(int)fminf(H-1,ceilf(fmaxf(a.y,fmaxf(b.y,c.y))));
+    int y0=(int)fmaxf(band_y0,floorf(fminf(a.y,fminf(b.y,c.y))));
+    int y1=(int)fminf(band_y1-1,ceilf(fmaxf(a.y,fmaxf(b.y,c.y))));
     float du_dx=(c.y-b.y)*inv_area,dv_dx=(a.y-c.y)*inv_area;
     for(int y=y0;y<=y1;y++){
         float py=y+.5f;
@@ -212,6 +224,78 @@ static void draw_tri(Projected a,Projected b,Projected c,Tri tri){
         pixels[idx]=rgb(clampi(r),clampi(g),clampi(bl));
     }
     }
+}
+
+#define RASTER_BAND_H 32
+static void raster_band(const Projected *p,int band){
+    int y0=band*RASTER_BAND_H;
+    int y1=y0+RASTER_BAND_H;
+    if(y1>H)y1=H;
+    for(int i=0;i<mesh.nt;i++){
+        Tri tri=mesh.t[i];
+        draw_tri(p[tri.a],p[tri.b],p[tri.c],tri,y0,y1);
+    }
+}
+
+static void raster_grab_bands(const Projected *p){
+    for(;;){
+        int band=atomic_fetch_add(&raster_next_band,1);
+        if(band>=raster_band_count)break;
+        raster_band(p,band);
+    }
+}
+
+static void *raster_worker(void *arg){
+    (void)arg;
+    unsigned seen=0;
+    pthread_mutex_lock(&raster_lock);
+    for(;;){
+        while(!raster_stop&&seen==raster_generation)
+            pthread_cond_wait(&raster_start,&raster_lock);
+        if(raster_stop)break;
+        seen=raster_generation;
+        const Projected *p=raster_vertices;
+        pthread_mutex_unlock(&raster_lock);
+        raster_grab_bands(p);
+        pthread_mutex_lock(&raster_lock);
+        raster_completed++;
+        pthread_cond_signal(&raster_done);
+    }
+    pthread_mutex_unlock(&raster_lock);
+    return NULL;
+}
+
+static void raster_init(void){
+    long cpus=sysconf(_SC_NPROCESSORS_ONLN);
+    raster_worker_count=cpus>1?(int)(cpus-1):0;
+    if(raster_worker_count>15)raster_worker_count=15;
+    for(int i=0;i<raster_worker_count;i++)
+        if(pthread_create(&raster_workers[i],NULL,raster_worker,NULL))
+            raster_worker_count=i;
+}
+
+static void raster_shutdown(void){
+    pthread_mutex_lock(&raster_lock);
+    raster_stop=true;
+    pthread_cond_broadcast(&raster_start);
+    pthread_mutex_unlock(&raster_lock);
+    for(int i=0;i<raster_worker_count;i++)pthread_join(raster_workers[i],NULL);
+}
+
+static void raster_draw(const Projected *p){
+    pthread_mutex_lock(&raster_lock);
+    raster_vertices=p;
+    raster_completed=0;
+    raster_band_count=(H+RASTER_BAND_H-1)/RASTER_BAND_H;
+    atomic_store(&raster_next_band,0);
+    raster_generation++;
+    pthread_cond_broadcast(&raster_start);
+    pthread_mutex_unlock(&raster_lock);
+    raster_grab_bands(p);
+    pthread_mutex_lock(&raster_lock);
+    while(raster_completed<(unsigned)raster_worker_count)
+        pthread_cond_wait(&raster_done,&raster_lock);
+    pthread_mutex_unlock(&raster_lock);
 }
 
 static void prompt_glyph(int index,int x,int y,int size){
@@ -311,10 +395,7 @@ static void frame(double seconds,bool static_frame,bool animation_only,bool over
         pose_head(frame_index);
         Projected p[MAX_VERT];
         for(int i=0;i<mesh.nv;i++)p[i]=project(mesh.v[i]);
-        for(int i=0;i<mesh.nt;i++){
-            Tri tri=mesh.t[i];
-            draw_tri(p[tri.a],p[tri.b],p[tri.c],tri);
-        }
+        raster_draw(p);
         if(frame_index==130){
             memcpy(final_head_cache,pixels,(size_t)W*H*sizeof(*pixels));
             final_cached=true;
@@ -459,7 +540,9 @@ int main(int argc,char **argv){
     if(command){if(control(&command)<0){puts("not running");return command=='s'?0:1;}return 0;}
     if(render_path||base_path){
         if(!load_head()||!load_scene()||!init_buffers(1920,1080))return 1;
+        raster_init();
         frame(130.f/30.f,true,false,render_path!=NULL);
+        raster_shutdown();
         return save_ppm(render_path?render_path:base_path);
     }
     if(SDL_Init(SDL_INIT_VIDEO|(with_audio?SDL_INIT_AUDIO:0))<0){fprintf(stderr,"SDL: %s\n",SDL_GetError());return 1;}
@@ -487,6 +570,7 @@ int main(int argc,char **argv){
     if(!renderer){fprintf(stderr,"Renderer: %s\n",SDL_GetError());SDL_DestroyWindow(win);goto fail;}
     SDL_Texture *texture=SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,W,H);
     if(!texture){fprintf(stderr,"Texture: %s\n",SDL_GetError());SDL_DestroyRenderer(renderer);SDL_DestroyWindow(win);goto fail;}
+    raster_init();
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"0");
     uint32_t audio_pos=0;SDL_AudioDeviceID audio=0;
     if(with_audio){SDL_AudioSpec want={0};want.freq=32000;want.format=AUDIO_S16SYS;
@@ -509,6 +593,7 @@ int main(int argc,char **argv){
         SDL_Delay(8);
     }
     if(audio)SDL_CloseAudioDevice(audio);
+    raster_shutdown();
     SDL_DestroyTexture(texture);SDL_DestroyRenderer(renderer);SDL_DestroyWindow(win);
 fail:
     close(server_fd);unlink(socket_path);SDL_Quit();
