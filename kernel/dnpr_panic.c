@@ -32,6 +32,7 @@
 #include <drm/drm_panic.h>
 #include "drm_draw_internal.h"
 #include "dnpr_panic.h"
+#include "dnpr_audio.h"
 #include "dnpr_frame_blob.h"
 #include "dnpr_live_blob.h"
 
@@ -438,6 +439,7 @@ static long dnpr_panic_blink(int state)
 		return 0;
 	tick = READ_ONCE(dnpr_tick) + 1;
 	WRITE_ONCE(dnpr_tick, tick);
+	dnpr_audio_maybe_stop();
 	for (k = 0; k < dnpr_sb_count; k++)
 		if (READ_ONCE(dnpr_sb_valid[k]))
 			dnpr_composite(&dnpr_sb[k], tick);
@@ -477,6 +479,7 @@ bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 	WRITE_ONCE(dnpr_tick, 0);
 	dnpr_composite(&dnpr_sb[idx], 0);
 	wmb();
+	dnpr_audio_start();
 	dnpr_install_blink();
 	return true;
 }

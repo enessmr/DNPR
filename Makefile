@@ -18,10 +18,11 @@ scene.bin: export_scene.py
 gameover_audio.bin: export_audio.py
 	python3 export_audio.py --source-root $(SUPERGODOT64_ROOT) --output $@
 
-kernel-assets: dnpr-test export_panic_scene.py export_panic_mesh.py
+kernel-assets: dnpr-test export_panic_scene.py export_panic_mesh.py export_panic_audio.py
 	./dnpr-test --render-base-frame .dnpr-panic-base.ppm
 	python3 export_panic_scene.py .dnpr-panic-base.ppm scene.bin kernel/dnpr_frame_blob.h
 	python3 export_panic_mesh.py mario_head.bin scene.bin kernel/dnpr_live_blob.h
+	python3 export_panic_audio.py --input gameover_audio.bin --output kernel/dnpr_audio_blob.h
 	rm .dnpr-panic-base.ppm
 
 clean:

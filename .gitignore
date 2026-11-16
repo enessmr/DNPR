@@ -10,6 +10,7 @@ colorful_font_atlas.png
 mario64_font_atlas.png
 kernel/dnpr_frame_blob.h
 kernel/dnpr_live_blob.h
+kernel/dnpr_audio_blob.h
 kernel/refind.conf.dnpr
 kernel/install_dnpr_kernel.sh
 
