@@ -1,0 +1,47 @@
+# DNPR preview prototype
+
+`dnpr-test` is the first, userspace phase of DNPR. It does **not** trigger or simulate a kernel panic. It renders the user-provided SuperGodot64 head geometry and game-over animation with a software depth buffer, Gouraud lighting, a tiled background, two spinning star sprites (one silver, one red), animated gold sparkles around the silver star, small animated red sparkles around the red star, and a flickering reboot prompt at the lower left. The prompt stacks `REBOOT`, `YOUR`, and `DEVICE` beside Mario, with the silver star underneath, following the supplied placement reference. It uses the SuperGodot64 colorful title glyph textures, sharing the V tile for U. Displays at 720p and above use a 128×128 atlas baked from the HD source; lower resolutions use a 16×16 atlas. Diffuse colour remains bright; interpolated normals add a separate reflective highlight. `export_head.py` bakes 131 posed frames from the local JSON into `mario_head.bin`. Playback freezes on the half-lidded sigh pose at zero-based frame 130; stars and particles keep moving. `export_scene.py` bakes the four original game-over background strips, 16 star frames, both prompt atlases, and six sparkle frames. `export_audio.py` captures the local ROM's game-over phrase and Mario's voice through the same endpoint. The audio continues after the pose freezes and ends at the near-silent break just before the title phrase. These game-derived assets should remain local unless their distribution rights are established.
+
+## Build and run
+
+```sh
+make
+./dnpr-test --displays
+./dnpr-test
+./dnpr-test --no-audio
+./dnpr-test --static
+./dnpr-test --animation
+./dnpr-test --status
+./dnpr-test --stop
+```
+
+The build needs Python 3 with NumPy and Pillow, SDL2 development files, the SuperGodot64 head and texture files, its local ROM, and its local `libsm64.so` mixer. Set `SUPERGODOT64_ROOT=/path/to/SuperGodot64` when the reference project is elsewhere. The generated game assets and preview binaries are intentionally excluded from this repository.
+
+Audio is on by default; `--no-audio` disables it. Escape also exits. `--render-frame preview.ppm` writes a headless 1920×1080 still image of the full scene; `--render-base-frame base.ppm` writes the same pose without the star, sparkle, and prompt overlays, which is the base the kernel panic asset bakes; `--frame N` selects a baked frame for inspection. The live preview renders directly to the Acer's native mode. `--display N` is accepted only when SDL and the display EDID identify that display as Acer. The current machine's Acer X233H is DVI-D-1, SDL display 0; the Microstep MP242 is HDMI-A-1, SDL display 1. If the Acer cannot be identified, fullscreen startup fails closed.
+
+The background keeps its stretched 16:9 tile geometry and repeats additional tiles on wider screens. Sparkles use 128×128 HD frames at 720p and above and 32×32 SD frames below 720p.
+
+The preview uses SDL's compositor-managed fullscreen desktop window. Hyprland retains DRM master and the display mode. Closing the window restores the prior desktop state without changing connector routing. The control socket lives at `$XDG_RUNTIME_DIR/dnpr-test-UID.sock`; a stale socket is replaced only after a failed connection. A process crash closes its Wayland window, so it cannot retain display ownership.
+
+## Verified on this system
+
+- Kernel: Linux 6.15.2, `CONFIG_DRM_PANIC=y`.
+- GPU: GTX 1060 bound to proprietary `nvidia` 575.57.08 modules.
+- Desktop: Hyprland on Wayland. Acer X233H: 1920×1080 at 60 Hz, DVI-D-1. Microstep MP242: 1920×1080 at 144 Hz, HDMI-A-1.
+- SDL enumerated and identified both displays. Hyprland reported the DNPR fullscreen window on monitor 0 (Acer), workspace 2.
+- Static preview, animation, audio, status, and stop completed. PipeWire showed a 32 kHz stereo playback stream. A comparison against music-only capture confirmed Mario's voice signal from about 0.5 to 1.5 seconds. The audio ends at 6 seconds with a quarter-second fade over the natural break. The rebuilt audio preview ran on Acer monitor 0 and stopped cleanly. After exit, no DNPR window remained, and both displays retained their modes and workspaces.
+- Native-resolution frame generation and build completed without warnings.
+- At 1920×1080, a local render benchmark measured about 15.5 ms per changing head pose and 1.1 ms per frozen frame after caching the completed head image. A separate 640×360 render verified the low-resolution atlas path.
+- The preview reads 644 posed 3D vertices and rasterizes 1,213 triangles per frame, with a depth buffer and live SDL audio. Headless renders of poses 0 and 60 have different hashes. This verifies the preview path; it does not verify a kernel panic.
+
+## Kernel panic backend
+
+`kernel/dnpr-linux-6.15.2.patch` adds a `CONFIG_DRM_DNPR` panic screen to Linux 6.15.2. The **currently booted** `6.15.2-dnpr` kernel uses a rendered frame of Mario's final pose. The replacement image installed at `/boot/vmlinuz-6.15.2-dnpr` contains an experimental fixed-point 3D triangle rasterizer fed by 131 posed vertex frames, with a depth buffer. It compiled and its first and later poses were checked with a Python model of the quantized rasterizer. That does not prove animation on a real panic or on the NVIDIA scanout path. The replacement only takes effect after reboot. Kernel panic audio is not implemented; the preview is the only version with proven 3D animation and audio.
+
+To build the experimental kernel source from this repository, run `make kernel-assets` with your own local game assets. This creates `kernel/dnpr_frame_blob.h` and `kernel/dnpr_live_blob.h`; both are excluded from Git because they contain game-derived data. Apply the patch to a matching Linux 6.15.2 tree, copy `kernel/dnpr_panic.c`, `kernel/dnpr_panic.h`, and both generated headers into `drivers/gpu/drm/`, enable `CONFIG_DRM_DNPR=y`, and rebuild the kernel and modules.
+
+The Linux 6.15.2 DRM panic implementation requires the primary plane's `get_scanout_buffer` helper. Upstream NVIDIA 575.57.08 does not provide it. `kernel/nvidia-drm-panic.patch` is an experimental attempt to add that hook and a block-linear pixel writer. It compiles, but successful panic display on this machine is unverified; do not infer it works from a successful kernel or module build.
+
+**Rebuild external GPU modules for the new kernel release** so normal desktop graphics can load. This alone only matches the kernel ABI; a panic display also needs a working scanout hook in the GPU module. This machine reuses `initramfs-linux.img`. It contains older kernel modules that cannot load into `6.15.2-dnpr`, but root storage and filesystem support are built into the kernel and matching NVIDIA modules live on the root filesystem. The machine has now booted `6.15.2-dnpr` with the reused initramfs and loaded the matching NVIDIA modules.
+
+The installed kernel is `/boot/vmlinuz-6.15.2-dnpr`; the previous DNPR image is backed up at `/mnt/nvme/vmlinuz-6.15.2-dnpr.pre-live3d`, and the original LFS kernel remains a separate rEFInd choice. The reused initramfs has not been rebuilt. A real panic on this machine has not been used to validate the replacement image.

@@ -1,0 +1,221 @@
+--- nvidia-drm-gem-nvkms-memory.h.orig	2026-11-16 14:51:05.611350316 +0300
++++ nvidia-drm-gem-nvkms-memory.h	2026-11-16 14:51:20.915152627 +0300
+@@ -50,6 +50,8 @@
+ 
+ extern const struct nv_drm_gem_object_funcs nv_gem_nvkms_memory_ops;
+ 
++int nv_drm_gem_nvkms_map(struct nv_drm_gem_nvkms_memory *nv_nvkms_memory);
++
+ static inline struct nv_drm_gem_nvkms_memory *to_nv_nvkms_memory(
+     struct nv_drm_gem_object *nv_gem)
+ {
+--- nvidia-drm-gem-nvkms-memory.c.orig	2026-11-16 14:51:05.612187050 +0300
++++ nvidia-drm-gem-nvkms-memory.c	2026-11-16 14:54:11.514889936 +0300
+@@ -71,8 +71,11 @@
+     nv_drm_free(nv_nvkms_memory);
+ }
+ 
+-static int __nv_drm_gem_nvkms_map(
+-    struct nv_drm_gem_nvkms_memory *nv_nvkms_memory);
++static inline int __nv_drm_gem_nvkms_map(
++    struct nv_drm_gem_nvkms_memory *nv_nvkms_memory)
++{
++    return nv_drm_gem_nvkms_map(nv_nvkms_memory);
++}
+ 
+ static int __nv_drm_gem_nvkms_mmap(struct nv_drm_gem_object *nv_gem,
+                                    struct vm_area_struct *vma)
+@@ -154,7 +157,7 @@
+     struct drm_device *dev,
+     const struct nv_drm_gem_object *nv_gem_src);
+ 
+-static int __nv_drm_gem_nvkms_map(
++int nv_drm_gem_nvkms_map(
+     struct nv_drm_gem_nvkms_memory *nv_nvkms_memory)
+ {
+     int ret = 0;
+@@ -207,7 +210,7 @@
+     struct nv_drm_gem_nvkms_memory *nv_nvkms_memory =
+         to_nv_nvkms_memory(nv_gem);
+ 
+-    int ret = __nv_drm_gem_nvkms_map(nv_nvkms_memory);
++    int ret = nv_drm_gem_nvkms_map(nv_nvkms_memory);
+     if (ret) {
+        return ERR_PTR(ret);
+     }
+--- nvidia-drm-fb.h.orig	2026-11-16 14:51:05.613020535 +0300
++++ nvidia-drm-fb.h	2026-11-16 14:51:59.987328835 +0300
+@@ -46,6 +46,9 @@
+         obj[NVKMS_MAX_PLANES_PER_SURFACE];
+ #endif
+ 
++    bool is_block_linear;
++    unsigned int log2_gobs_per_block_y;
++
+     struct drm_framebuffer base;
+ };
+ 
+--- nvidia-drm-fb.c.orig	2026-11-16 14:51:05.613779388 +0300
++++ nvidia-drm-fb.c	2026-11-16 14:52:30.284462071 +0300
+@@ -175,6 +175,12 @@
+              * frontbuffer. DRM provides the needed callbacks to achieve this.
+              */
+             params.noDisplayCaching |= !!nv_gem->is_drm_dumb;
++
++            if (nv_gem->ops == &nv_gem_nvkms_memory_ops) {
++                struct nv_drm_gem_nvkms_memory *nv_nvkms_memory =
++                    to_nv_nvkms_memory(nv_gem);
++                nv_drm_gem_nvkms_map(nv_nvkms_memory);
++            }
+         }
+     }
+     params.height = fb->height;
+@@ -187,6 +193,9 @@
+             NvKmsSurfaceMemoryLayoutBlockLinear :
+             NvKmsSurfaceMemoryLayoutPitch;
+ 
++        nv_fb->is_block_linear = (modifier & 0x10) != 0;
++        nv_fb->log2_gobs_per_block_y = modifier & 0xf;
++
+         // See definition of DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D, we are testing
+         // 'c', the lossless compression field of the modifier
+         if (params.layout == NvKmsSurfaceMemoryLayoutBlockLinear &&
+@@ -200,6 +209,8 @@
+         params.log2GobsPerBlockY = modifier & 0xf;
+     } else {
+         params.explicit_layout = false;
++        nv_fb->is_block_linear = false;
++        nv_fb->log2_gobs_per_block_y = 0;
+     }
+ 
+     /*
+--- nvidia-drm-crtc.c.orig	2026-11-16 14:51:05.614500892 +0300
++++ nvidia-drm-crtc.c	2026-11-16 14:53:47.820791859 +0300
+@@ -47,6 +47,12 @@
+ #include <drm/drm_color_mgmt.h>
+ #endif
+ 
++#if defined(CONFIG_DRM_PANIC)
++#include <drm/drm_panic.h>
++#include <linux/iosys-map.h>
++#include <linux/math.h>
++#endif
++
+ /*
+  * The two arrays below specify the PQ EOTF transfer function that's used to
+  * convert from PQ encoded L'M'S' fixed-point to linear LMS FP16. This transfer
+@@ -2072,6 +2078,98 @@
+     .atomic_check   = nv_drm_plane_atomic_check,
+ };
+ 
++#if defined(CONFIG_DRM_PANIC)
++#define NV_TILE_GOB_WIDTH_BYTES 64
++#define NV_TILE_GOB_HEIGHT 8
++
++static u32 nv_panic_blk_h = 128;
++
++static void nv_drm_panic_set_pixel(struct drm_scanout_buffer *sb,
++                                   unsigned int x, unsigned int y,
++                                   u32 color)
++{
++    u32 blk_columns, blk_x, blk_y, blk_off, in_blk_x, in_blk_y, off;
++
++    blk_columns = DIV_ROUND_UP(sb->pitch[0], NV_TILE_GOB_WIDTH_BYTES);
++    blk_x = (x * 4) / NV_TILE_GOB_WIDTH_BYTES;
++    blk_y = y / nv_panic_blk_h;
++    blk_off = ((blk_y * blk_columns) + blk_x) * (NV_TILE_GOB_WIDTH_BYTES * nv_panic_blk_h);
++
++    in_blk_x = x % (NV_TILE_GOB_WIDTH_BYTES / 4);
++    in_blk_y = y % nv_panic_blk_h;
++    off = blk_off + in_blk_x * 4 + in_blk_y * NV_TILE_GOB_WIDTH_BYTES;
++
++    iosys_map_wr(&sb->map[0], off, u32, color);
++}
++
++static int nv_drm_primary_plane_get_scanout_buffer(struct drm_plane *plane,
++                                                   struct drm_scanout_buffer *sb)
++{
++    struct drm_framebuffer *fb;
++    struct nv_drm_framebuffer *nv_fb;
++    struct drm_gem_object *gem;
++    struct nv_drm_gem_object *nv_gem;
++    struct nv_drm_gem_nvkms_memory *nv_nvkms_memory;
++
++    if (!plane->state || !plane->state->fb)
++        return -EINVAL;
++
++    fb = plane->state->fb;
++    if (fb->format->num_planes != 1)
++        return -EOPNOTSUPP;
++
++    nv_fb = to_nv_framebuffer(fb);
++    if (!nv_fb)
++        return -EINVAL;
++
++    gem = nv_fb_get_gem_obj(fb, 0);
++    if (!gem)
++        return -EINVAL;
++
++    nv_gem = to_nv_gem_object(gem);
++    if (!nv_gem || nv_gem->ops != &nv_gem_nvkms_memory_ops)
++        return -EOPNOTSUPP;
++
++    nv_nvkms_memory = to_nv_nvkms_memory(nv_gem);
++    if (!nv_nvkms_memory || !nv_nvkms_memory->physically_mapped ||
++        !nv_nvkms_memory->pWriteCombinedIORemapAddress)
++        return -ENOMEM;
++
++    iosys_map_set_vaddr_iomem(&sb->map[0],
++        (void __iomem *)((char *)nv_nvkms_memory->pWriteCombinedIORemapAddress + fb->offsets[0]));
++
++    sb->width = fb->width;
++    sb->height = fb->height;
++    sb->pitch[0] = fb->pitches[0];
++    sb->format = fb->format;
++
++    if (nv_fb->is_block_linear) {
++        unsigned int gobs = 1 << nv_fb->log2_gobs_per_block_y;
++        if (!gobs)
++            gobs = 16;
++        nv_panic_blk_h = NV_TILE_GOB_HEIGHT * gobs;
++        if (fb->format->cpp[0] != 4)
++            return -EOPNOTSUPP;
++        sb->set_pixel = nv_drm_panic_set_pixel;
++    } else {
++        sb->set_pixel = NULL;
++    }
++
++    return 0;
++}
++
++static void nv_drm_primary_plane_panic_flush(struct drm_plane *plane)
++{
++    wmb();
++}
++
++static const struct drm_plane_helper_funcs nv_primary_plane_helper_funcs = {
++    .atomic_check       = nv_drm_plane_atomic_check,
++    .get_scanout_buffer = nv_drm_primary_plane_get_scanout_buffer,
++    .panic_flush        = nv_drm_primary_plane_panic_flush,
++};
++#endif
++
+ static void nv_drm_crtc_destroy(struct drm_crtc *crtc)
+ {
+     struct nv_drm_crtc *nv_crtc = to_nv_crtc(crtc);
+@@ -2921,7 +3019,15 @@
+     nv_plane->supportsColorProperties = false;
+ #endif
+ 
++#if defined(CONFIG_DRM_PANIC)
++    if (plane_type == DRM_PLANE_TYPE_PRIMARY) {
++        drm_plane_helper_add(plane, &nv_primary_plane_helper_funcs);
++    } else {
++        drm_plane_helper_add(plane, &nv_plane_helper_funcs);
++    }
++#else
+     drm_plane_helper_add(plane, &nv_plane_helper_funcs);
++#endif
+ 
+     if (plane_type != DRM_PLANE_TYPE_CURSOR) {
+         nv_plane->ilut_caps = pResInfo->lutCaps.layer[layer_idx].ilut;

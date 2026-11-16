@@ -1,0 +1,81 @@
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -120,6 +120,15 @@
+ 	  To support Hi-DPI Display, you can enable bigger fonts like
+ 	  FONT_TER16x32
+ 
++config DRM_DNPR
++	bool "DNPR preloaded animated panic scene"
++	depends on DRM_PANIC
++	select ZLIB_INFLATE
++	help
++	  Draw a preloaded DNPR scene through the driver panic scanout
++	  hook: frame 0 at the first panic draw, then the star, sparkle,
++	  and prompt animation composited live by the panic loop's blink
++	  callback. This only works with a driver that implements
++	  get_scanout_buffer; it does not add that hook to a driver.
++
+ config DRM_PANIC_FOREGROUND_COLOR
+ 	hex "Drm panic screen foreground color, in RGB"
+ 	depends on DRM_PANIC
+@@ -141,6 +150,7 @@
+ 
+ config DRM_PANIC_SCREEN
+ 	string "Panic screen formatter"
++	default "dnpr" if DRM_DNPR
+ 	default "user"
+ 	depends on DRM_PANIC
+ 	help
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -91,6 +91,7 @@
+ 	drm_privacy_screen_x86.o
+ drm-$(CONFIG_DRM_ACCEL) += ../../accel/drm_accel.o
+ drm-$(CONFIG_DRM_PANIC) += drm_panic.o
++drm-$(CONFIG_DRM_DNPR) += dnpr_panic.o
+ drm-$(CONFIG_DRM_DRAW) += drm_draw.o
+ drm-$(CONFIG_DRM_PANIC_SCREEN_QR_CODE) += drm_panic_qr.o
+ obj-$(CONFIG_DRM)	+= drm.o
+--- a/drivers/gpu/drm/drm_panic.c
++++ b/drivers/gpu/drm/drm_panic.c
+@@ -32,6 +32,9 @@
+ 
+ #include "drm_crtc_internal.h"
+ #include "drm_draw_internal.h"
++#ifdef CONFIG_DRM_DNPR
++#include "dnpr_panic.h"
++#endif
+ 
+ MODULE_AUTHOR("Jocelyn Falempe");
+ MODULE_DESCRIPTION("DRM panic handler");
+@@ -667,6 +670,10 @@
+ 
+ static void draw_panic_dispatch(struct drm_scanout_buffer *sb)
+ {
++#ifdef CONFIG_DRM_DNPR
++	if (!strcmp(drm_panic_screen, "dnpr") && dnpr_panic_render(sb))
++		return;
++#endif
+ 	if (!strcmp(drm_panic_screen, "kmsg")) {
+ 		draw_panic_static_kmsg(sb);
+ 	} else if (!strcmp(drm_panic_screen, "qr_code")) {
+@@ -847,6 +854,10 @@
+ void __init drm_panic_init(void)
+ {
+ 	drm_panic_qr_init();
++#ifdef CONFIG_DRM_DNPR
++	if (dnpr_panic_init())
++		pr_warn("DNPR: scene preload failed; using standard panic screen\n");
++#endif
+ }
+ 
+ /**
+@@ -854,5 +865,8 @@
+  */
+ void drm_panic_exit(void)
+ {
++#ifdef CONFIG_DRM_DNPR
++	dnpr_panic_exit();
++#endif
+ 	drm_panic_qr_exit();
+ }
