@@ -155,14 +155,35 @@ static u16 dnpr_rgb565(unsigned int r, unsigned int g, unsigned int b)
 	return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 }
 
+/* Divide by the triangle's invariant area without a per-pixel DIV. The
+ * high half of n * floor(2^64 / area) is either the exact quotient or one
+ * below it; the remainder check restores exact truncating division.
+ */
+static s64 dnpr_div_by_area(s64 n, u64 area, u64 reciprocal)
+{
+	u64 magnitude, quotient;
+
+	if (area == 1)
+		return n;
+	magnitude = n < 0 ? 0 - (u64)n : (u64)n;
+	quotient = mul_u64_u64_shr(magnitude, reciprocal, 64);
+	if (magnitude - quotient * area >= area)
+		quotient++;
+	return n < 0 ? -(s64)quotient : (s64)quotient;
+}
+
 static unsigned int dnpr_specular(s64 w0, s64 w1, s64 w2, s64 area,
+				 u64 reciprocal,
 				 const struct dnpr_projected *a,
 				 const struct dnpr_projected *b,
 				 const struct dnpr_projected *c)
 {
-	s64 nx = div64_s64(w0 * a->nx + w1 * b->nx + w2 * c->nx, area);
-	s64 ny = div64_s64(w0 * a->ny + w1 * b->ny + w2 * c->ny, area);
-	s64 nz = div64_s64(w0 * a->nz + w1 * b->nz + w2 * c->nz, area);
+	s64 nx = dnpr_div_by_area(w0 * a->nx + w1 * b->nx + w2 * c->nx,
+				    area, reciprocal);
+	s64 ny = dnpr_div_by_area(w0 * a->ny + w1 * b->ny + w2 * c->ny,
+				    area, reciprocal);
+	s64 nz = dnpr_div_by_area(w0 * a->nz + w1 * b->nz + w2 * c->nz,
+				    area, reciprocal);
 	u64 length = int_sqrt64(nx * nx + ny * ny + nz * nz);
 	s64 h = length ? (-59 * nx + 41 * ny + 106 * nz) / length : 0;
 	u64 q;
@@ -211,12 +232,18 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 	s64 area = dnpr_edge(a->x, a->y, b->x, b->y, c->x, c->y);
 	s64 slope_ab = 0, slope_bc = 0, slope_ca = 0;
 	s64 step0, step1;
+	u64 reciprocal = 0, remainder;
 	int x0, x1, y0, y1, x, y, sign;
 
 	if (!area)
 		return;
 	sign = area < 0 ? -1 : 1;
 	area *= sign;
+	if (area != 1) {
+		reciprocal = div64_u64_rem(U64_MAX, area, &remainder);
+		if (remainder == area - 1)
+			reciprocal++;
+	}
 	y0 = clamp_t(int, min3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
 	y1 = clamp_t(int, max3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
 	if (y0 < band_y0)
@@ -267,15 +294,19 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 			if (w2 < 0)
 				goto next_pixel;
 			weighted = w0 * a->z + w1 * b->z + w2 * c->z;
-			z = div64_s64(weighted, area);
+			z = dnpr_div_by_area(weighted, area, reciprocal);
 			index = (size_t)y * DNPR_WIDTH + x;
 			if (z >= dnpr_live_depth[index])
 				goto next_pixel;
 			dnpr_live_depth[index] = z;
-			sr = div64_s64(w0 * a->lr + w1 * b->lr + w2 * c->lr, area);
-			sg = div64_s64(w0 * a->lg + w1 * b->lg + w2 * c->lg, area);
-			sb = div64_s64(w0 * a->lb + w1 * b->lb + w2 * c->lb, area);
-			spec = dnpr_specular(w0, w1, w2, area, a, b, c);
+			sr = dnpr_div_by_area(w0 * a->lr + w1 * b->lr + w2 * c->lr,
+					  area, reciprocal);
+			sg = dnpr_div_by_area(w0 * a->lg + w1 * b->lg + w2 * c->lg,
+					  area, reciprocal);
+			sb = dnpr_div_by_area(w0 * a->lb + w1 * b->lb + w2 * c->lb,
+					  area, reciprocal);
+			spec = dnpr_specular(w0, w1, w2, area, reciprocal,
+					     a, b, c);
 			r = min(255U, (tri->r * sr >> 8) + spec);
 			g = min(255U, (tri->g * sg >> 8) + spec);
 			blue = min(255U, (tri->blue * sb >> 8) + spec);
