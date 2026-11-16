@@ -16,6 +16,7 @@
  */
 #include <asm/barrier.h>
 #include <linux/errno.h>
+#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/iosys-map.h>
 #include <linux/math.h>
@@ -372,9 +373,8 @@ static void dnpr_composite(struct drm_scanout_buffer *sb, unsigned int tick)
 	unsigned int cpp = sb->format->cpp[0];
 	void (*set_pixel)(struct drm_scanout_buffer *, unsigned int, unsigned int,
 			  u32) = sb->set_pixel;
-	/* Diagnostic: magenta bar whose width grows with the animation tick
-	 * (8..320 px, wrapping every 40 ticks). A frozen 8 px bar means the
-	 * blink handler never composited again.
+	/* Diagnostic frame counter: 8 px wide at frame 0, then grows by
+	 * 8 px per redraw. Keep this visible while testing panic animation.
 	 */
 	unsigned int bar_w = ((tick % 40) + 1) * 8;
 	unsigned int x, y;
@@ -458,7 +458,7 @@ static void dnpr_install_blink(void)
 
 bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 {
-	unsigned int idx;
+	unsigned int idx, frame;
 
 	if (!READ_ONCE(dnpr_ready) || !dnpr_scanout_ok(sb))
 		return false;
@@ -480,6 +480,19 @@ bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 	dnpr_composite(&dnpr_sb[idx], 0);
 	wmb();
 	dnpr_audio_start();
+	/* The DRM kmsg dumper can display its first frame and then never reach
+	 * panic()'s later blink loop on this NVIDIA system. Play the finite
+	 * sequence here, while this scanout mapping is known to be valid. This
+	 * is a real redraw of the posed 3D mesh on every iteration, not a
+	 * pre-rendered frame sequence. Keep the final sigh pose on screen.
+	 */
+	for (frame = 1; frame <= 30; frame++) {
+		mdelay(200);
+		dnpr_composite(&dnpr_sb[idx], frame);
+		wmb();
+		dnpr_audio_maybe_stop();
+	}
+	WRITE_ONCE(dnpr_tick, frame - 1);
 	dnpr_install_blink();
 	return true;
 }
