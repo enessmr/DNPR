@@ -13,6 +13,9 @@
  * same write barrier the driver's panic_flush uses.
  */
 #include <asm/barrier.h>
+#include <linux/atomic.h>
+#include <linux/cpumask.h>
+#include <linux/crc32.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
 #include <linux/init.h>
@@ -22,8 +25,11 @@
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/moduleparam.h>
 #include <linux/printk.h>
+#include <linux/processor.h>
 #include <linux/slab.h>
+#include <linux/smp.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 #include <linux/zlib.h>
@@ -73,6 +79,33 @@ static u32 *dnpr_shared_frame;
 static u8 *dnpr_shared_dirty;
 static bool dnpr_shared_valid;
 static bool dnpr_ready;
+
+/* Panic-time raster fan-out. One helper CPU owns the audio lifecycle and
+ * every other CPU plus the orchestrator rasterize 32-row bands of the head
+ * from an atomic queue. Rows never straddle CPUs, so the depth buffer needs
+ * no locking and every band is deterministic from the same projected
+ * vertices. The orchestrator's wait is always bounded by a deadline:
+ * helpers that never service their IPI are pruned after the first miss and
+ * the frame finishes on one CPU, so the worst case is the uniprocessor
+ * draw. A straggler can only re-write rows with identical values.
+ */
+static bool dnpr_smp = true;
+module_param_named(smp, dnpr_smp, bool, 0444);
+static bool dnpr_smp_selftest;
+module_param_named(smp_selftest, dnpr_smp_selftest, bool, 0444);
+
+#define DNPR_BAND_H 32U
+#define DNPR_BAND_COUNT DIV_ROUND_UP(DNPR_HEIGHT, DNPR_BAND_H)
+#define DNPR_RASTER_TIMEOUT_MS 25U
+
+static atomic_t dnpr_band_next = ATOMIC_INIT(DNPR_BAND_COUNT);
+static atomic_t dnpr_raster_done = ATOMIC_INIT(0);
+static atomic_t dnpr_raster_alive = ATOMIC_INIT(0);
+static atomic_t dnpr_raster_stop = ATOMIC_INIT(0);
+static unsigned int dnpr_raster_gen;
+static unsigned int dnpr_helper_count;
+static unsigned int dnpr_governor_cpu;
+static bool dnpr_helpers_active;
 
 /* Quantized 3D geometry. Positions are signed Q8 model coordinates; RGB
  * lighting factors are unsigned Q8. Triangles are rasterized on every posed
@@ -172,7 +205,8 @@ static void dnpr_span_edge(const struct dnpr_projected *a,
 static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 				    const struct dnpr_projected *b,
 				    const struct dnpr_projected *c,
-				    const struct dnpr_live_triangle *tri)
+				    const struct dnpr_live_triangle *tri,
+				    int band_y0, int band_y1)
 {
 	s64 area = dnpr_edge(a->x, a->y, b->x, b->y, c->x, c->y);
 	s64 slope_ab = 0, slope_bc = 0, slope_ca = 0;
@@ -183,10 +217,16 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 		return;
 	sign = area < 0 ? -1 : 1;
 	area *= sign;
-	x0 = clamp_t(int, min3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
-	x1 = clamp_t(int, max3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
 	y0 = clamp_t(int, min3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
 	y1 = clamp_t(int, max3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
+	if (y0 < band_y0)
+		y0 = band_y0;
+	if (y1 > band_y1)
+		y1 = band_y1;
+	if (y0 > y1)
+		return; /* The band misses every row of this triangle. */
+	x0 = clamp_t(int, min3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
+	x1 = clamp_t(int, max3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
 	if (a->y != b->y)
 		slope_ab = div_s64((s64)(b->x - a->x) * (1LL << 32),
 				 b->y - a->y);
@@ -252,9 +292,13 @@ static s32 dnpr_lerp_s32(s32 a, s32 b, unsigned int fraction)
 	return a + ((s64)(b - a) * fraction >> 16);
 }
 
-static bool dnpr_render_live_head(unsigned int elapsed_ms)
+static const struct dnpr_live_triangle *dnpr_tris(void)
 {
-	const struct dnpr_live_triangle *tris;
+	return (const void *)(dnpr_live_data + DNPR_BASE_BYTES);
+}
+
+static bool dnpr_render_live_head_prepare(unsigned int elapsed_ms)
+{
 	const struct dnpr_live_vertex *verts, *next_verts;
 	u64 pose_q = min_t(u64, (u64)elapsed_ms * 30 * 65536 / 1000,
 			   (u64)(DNPR_LIVE_NF - 1) << 16);
@@ -266,11 +310,11 @@ static bool dnpr_render_live_head(unsigned int elapsed_ms)
 	dnpr_last_pose_q = pose_q;
 	memcpy(dnpr_base, dnpr_live_data, DNPR_BASE_BYTES);
 	memset(dnpr_live_depth, 0xff, DNPR_BASE_BYTES);
-	tris = (const void *)(dnpr_live_data + DNPR_BASE_BYTES);
 	verts = (const void *)(dnpr_live_data + DNPR_BASE_BYTES +
-		DNPR_LIVE_NT * sizeof(*tris) + pose * DNPR_LIVE_NV * sizeof(*verts));
+		DNPR_LIVE_NT * sizeof(struct dnpr_live_triangle) +
+		pose * DNPR_LIVE_NV * sizeof(*verts));
 	next_verts = (const void *)(dnpr_live_data + DNPR_BASE_BYTES +
-		DNPR_LIVE_NT * sizeof(*tris) +
+		DNPR_LIVE_NT * sizeof(struct dnpr_live_triangle) +
 		min(pose + 1, DNPR_LIVE_NF - 1) * DNPR_LIVE_NV * sizeof(*verts));
 	for (i = 0; i < DNPR_LIVE_NV; i++) {
 		s32 vx = dnpr_lerp_s32(verts[i].x, next_verts[i].x, fraction);
@@ -308,16 +352,128 @@ static bool dnpr_render_live_head(unsigned int elapsed_ms)
 	dnpr_head_bounds.y0 = y0;
 	dnpr_head_bounds.x1 = x1;
 	dnpr_head_bounds.y1 = y1;
-	for (i = 0; i < DNPR_LIVE_NT; i++) {
-		const struct dnpr_live_triangle *t = &tris[i];
+	return true;
+}
 
-		if (t->a >= DNPR_LIVE_NV || t->b >= DNPR_LIVE_NV ||
-		    t->c >= DNPR_LIVE_NV)
+/* Rasterize every triangle over the row range [y0, y1] inclusive. */
+static void dnpr_raster_rows(int y0, int y1)
+{
+	const struct dnpr_live_triangle *t = dnpr_tris();
+	unsigned int i;
+
+	for (i = 0; i < DNPR_LIVE_NT; i++) {
+		if (t[i].a >= DNPR_LIVE_NV || t[i].b >= DNPR_LIVE_NV ||
+		    t[i].c >= DNPR_LIVE_NV)
 			continue;
-		dnpr_draw_live_triangle(&dnpr_projected[t->a],
-					&dnpr_projected[t->b],
-					&dnpr_projected[t->c], t);
+		dnpr_draw_live_triangle(&dnpr_projected[t[i].a],
+					&dnpr_projected[t[i].b],
+					&dnpr_projected[t[i].c], &t[i],
+					y0, y1);
 	}
+}
+
+static void dnpr_grab_bands(void)
+{
+	for (;;) {
+		int band = atomic_fetch_inc(&dnpr_band_next);
+		int y0 = band * (int)DNPR_BAND_H;
+
+		if (band >= (int)DNPR_BAND_COUNT)
+			return;
+		dnpr_raster_rows(y0, min(y0 + (int)DNPR_BAND_H - 1,
+					 (int)DNPR_HEIGHT - 1));
+	}
+}
+
+static void dnpr_raster_helper(void *unused)
+{
+	bool governor = smp_processor_id() == READ_ONCE(dnpr_governor_cpu);
+	unsigned int seen = 0;
+
+	(void)unused;
+	atomic_inc(&dnpr_raster_alive);
+	for (;;) {
+		unsigned int gen;
+
+		for (;;) {
+			gen = READ_ONCE(dnpr_raster_gen);
+			if (gen != seen || atomic_read(&dnpr_raster_stop))
+				break;
+			cpu_relax();
+		}
+		if (atomic_read(&dnpr_raster_stop))
+			return;
+		seen = gen;
+		smp_rmb(); /* projected vertices published before the bump */
+		if (governor)
+			dnpr_audio_maybe_stop(); /* audio owns this CPU */
+		else
+			dnpr_grab_bands();
+		atomic_inc(&dnpr_raster_done);
+	}
+}
+
+static void dnpr_raster_start_helpers(void)
+{
+	cpumask_t mask;
+
+	if (!dnpr_smp || dnpr_helpers_active || num_online_cpus() < 3)
+		return;
+	cpumask_copy(&mask, cpu_online_mask);
+	cpumask_clear_cpu(smp_processor_id(), &mask);
+	if (cpumask_empty(&mask))
+		return;
+	atomic_set(&dnpr_raster_stop, 0);
+	atomic_set(&dnpr_raster_alive, 0);
+	/* Exhausted queue: helpers that wake early rasterize nothing. */
+	atomic_set(&dnpr_band_next, DNPR_BAND_COUNT);
+	WRITE_ONCE(dnpr_governor_cpu, cpumask_first(&mask));
+	dnpr_helper_count = cpumask_weight(&mask);
+	preempt_disable();
+	/* wait=0: the IPIs queue and run as each target can; the raster
+	 * deadline covers any target that never services one. */
+	smp_call_function_many(&mask, dnpr_raster_helper, NULL, 0);
+	preempt_enable();
+	dnpr_helpers_active = true;
+}
+
+static void dnpr_raster_frame(void)
+{
+	unsigned int done;
+	s64 deadline;
+
+	atomic_set(&dnpr_raster_done, 0);
+	atomic_set(&dnpr_band_next, 0);
+	smp_wmb(); /* projected vertices and cleared buffers are ready */
+	WRITE_ONCE(dnpr_raster_gen, dnpr_raster_gen + 1);
+	dnpr_grab_bands(); /* the orchestrator joins the queue */
+	deadline = ktime_get_mono_fast_ns() +
+		(s64)DNPR_RASTER_TIMEOUT_MS * 1000000;
+	while ((done = atomic_read(&dnpr_raster_done)) < dnpr_helper_count &&
+	       ktime_get_mono_fast_ns() < deadline)
+		cpu_relax();
+	if (done < dnpr_helper_count) {
+		/* Prune unresponsive helpers once and finish solo; their
+		 * late writes, if any, duplicate rows with equal values. */
+		unsigned int alive = atomic_read(&dnpr_raster_alive);
+
+		if (alive && alive < dnpr_helper_count)
+			dnpr_helper_count = alive;
+		dnpr_grab_bands();
+	}
+	smp_rmb();
+}
+
+static bool dnpr_render_live_head(unsigned int elapsed_ms)
+{
+	bool head_changed = dnpr_render_live_head_prepare(elapsed_ms);
+
+	if (!head_changed)
+		return false;
+	if (dnpr_helpers_active)
+		dnpr_raster_frame();
+	else
+		dnpr_raster_rows(0, DNPR_HEIGHT - 1);
 	return true;
 }
 
@@ -709,6 +865,7 @@ void dnpr_panic_animate(void)
 			native_scanout = true;
 	start_ns = ktime_get_mono_fast_ns();
 	next_ns = start_ns + DNPR_FASTEST_FRAME_NS;
+	dnpr_raster_start_helpers();
 	dnpr_audio_start();
 	for (;;) {
 		now_ns = ktime_get_mono_fast_ns();
@@ -747,6 +904,46 @@ void dnpr_panic_animate(void)
 		dnpr_audio_maybe_stop();
 	}
 }
+
+/* Boot-time selftest: render reference poses on one CPU, render the same
+ * poses through the SMP band queue, and CRC-compare the shared frame.
+ * Helpers are parked afterwards, so a panic later in the same boot falls
+ * back to the uniprocessor draw. Boot with dnpr_panic.smp_selftest=1 once
+ * and read the results from dmesg.
+ */
+static int __init dnpr_smp_selftest_run(void)
+{
+	static const unsigned int poses[3] = { 0, 60, 105 };
+	u32 crc[3][2];
+	unsigned int k;
+
+	if (!dnpr_smp_selftest || !dnpr_smp || !READ_ONCE(dnpr_ready))
+		return 0;
+	for (k = 0; k < 3; k++) {
+		WRITE_ONCE(dnpr_last_pose_q, ~0ULL);
+		dnpr_render_live_head(poses[k] * 1000U / 30U);
+		crc[k][0] = crc32_le(~0U, (void *)dnpr_base, DNPR_BASE_BYTES);
+	}
+	dnpr_raster_start_helpers();
+	for (k = 0; k < 3; k++) {
+		u64 t0 = ktime_get_mono_fast_ns();
+		bool same;
+
+		WRITE_ONCE(dnpr_last_pose_q, ~0ULL);
+		dnpr_render_live_head(poses[k] * 1000U / 30U);
+		crc[k][1] = crc32_le(~0U, (void *)dnpr_base, DNPR_BASE_BYTES);
+		same = crc[k][0] == crc[k][1];
+		pr_info("DNPR SMP selftest pose %u: %llu us, helpers %u/%u, %s\n",
+			poses[k],
+			div64_u64(ktime_get_mono_fast_ns() - t0, 1000),
+			atomic_read(&dnpr_raster_alive), dnpr_helper_count,
+			same ? "identical" : "MISMATCH");
+	}
+	atomic_inc(&dnpr_raster_stop);
+	dnpr_helpers_active = false;
+	return 0;
+}
+late_initcall(dnpr_smp_selftest_run);
 
 int __init dnpr_panic_init(void)
 {
