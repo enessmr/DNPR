@@ -106,6 +106,9 @@ struct dnpr_rect {
 static u8 *dnpr_live_data;
 static u16 *dnpr_live_depth;
 static struct dnpr_projected dnpr_projected[DNPR_LIVE_NV];
+#define DNPR_NORMAL_LENGTHS (3 * 128 * 128 + 1)
+static u8 dnpr_normal_lengths[DNPR_NORMAL_LENGTHS];
+static u8 dnpr_specular_levels[128];
 static u64 dnpr_last_pose_q = ~0ULL;
 static struct {
 	int x0, y0, x1, y1;
@@ -121,25 +124,14 @@ static u16 dnpr_rgb565(unsigned int r, unsigned int g, unsigned int b)
 	return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 }
 
-static unsigned int dnpr_specular(s64 w0, s64 w1, s64 w2, s64 area,
-				 const struct dnpr_projected *a,
-				 const struct dnpr_projected *b,
-				 const struct dnpr_projected *c)
+static unsigned int dnpr_specular(s32 nx, s32 ny, s32 nz)
 {
-	s64 nx = div64_s64(w0 * a->nx + w1 * b->nx + w2 * c->nx, area);
-	s64 ny = div64_s64(w0 * a->ny + w1 * b->ny + w2 * c->ny, area);
-	s64 nz = div64_s64(w0 * a->nz + w1 * b->nz + w2 * c->nz, area);
-	u64 length = int_sqrt64(nx * nx + ny * ny + nz * nz);
-	s64 h = length ? (-59 * nx + 41 * ny + 106 * nz) / length : 0;
-	u64 q;
-	int i;
+	unsigned int length = dnpr_normal_lengths[nx * nx + ny * ny + nz * nz];
+	int dot = -59 * nx + 41 * ny + 106 * nz;
 
-	if (h <= 0)
+	if (!length || dot < 123 * length)
 		return 0;
-	q = min_t(u64, h, 127) * 65536 / 127;
-	for (i = 0; i < 7; i++)
-		q = q * q >> 16; /* h^128, matching the preview highlight */
-	return 90 * q >> 16;
+	return dnpr_specular_levels[min(dot / (int)length, 127)];
 }
 
 static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
@@ -148,44 +140,69 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 				    const struct dnpr_live_triangle *tri)
 {
 	s64 area = dnpr_edge(a->x, a->y, b->x, b->y, c->x, c->y);
+	u64 inverse_area;
+	s64 step0, step1, row0, row1;
 	int x0, x1, y0, y1, x, y, sign;
 
 	if (!area)
 		return;
 	sign = area < 0 ? -1 : 1;
 	area *= sign;
+	/* One division per triangle, rather than several for every pixel. The
+	 * Q56 reciprocal keeps Q16 barycentric weights accurate on large faces.
+	 */
+	inverse_area = div64_u64(1ULL << 56, area);
 	x0 = clamp_t(int, min3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
 	x1 = clamp_t(int, max3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
 	y0 = clamp_t(int, min3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
 	y1 = clamp_t(int, max3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
+	step0 = (s64)sign * (c->y - b->y);
+	step1 = (s64)sign * (a->y - c->y);
+	row0 = sign * dnpr_edge(b->x, b->y, c->x, c->y, x0, y0);
+	row1 = sign * dnpr_edge(c->x, c->y, a->x, a->y, x0, y0);
 	for (y = y0; y <= y1; y++) {
+		s64 w0 = row0, w1 = row1;
+
 		for (x = x0; x <= x1; x++) {
-			s64 w0 = sign * dnpr_edge(b->x, b->y, c->x, c->y, x, y);
-			s64 w1 = sign * dnpr_edge(c->x, c->y, a->x, a->y, x, y);
-			s64 w2, weighted;
-			unsigned int z, sr, sg, sb, spec, r, g, blue;
+			s64 w2 = area - w0 - w1;
+			unsigned int q0, q1, q2, z, sr, sg, sb, spec, r, g, blue;
+			s32 nx, ny, nz;
 			size_t index;
 
-			if (w0 < 0 || w1 < 0)
-				continue;
-			w2 = area - w0 - w1;
-			if (w2 < 0)
-				continue;
-			weighted = w0 * a->z + w1 * b->z + w2 * c->z;
-			z = div64_s64(weighted, area);
+			if (w0 < 0 || w1 < 0 || w2 < 0)
+				goto next_pixel;
+			q0 = w0 * inverse_area >> 40;
+			q1 = w1 * inverse_area >> 40;
+			q2 = 65536 - q0 - q1;
+			z = ((u64)q0 * a->z + (u64)q1 * b->z +
+			     (u64)q2 * c->z) >> 16;
 			index = (size_t)y * DNPR_WIDTH + x;
 			if (z >= dnpr_live_depth[index])
-				continue;
+				goto next_pixel;
 			dnpr_live_depth[index] = z;
-			sr = div64_s64(w0 * a->lr + w1 * b->lr + w2 * c->lr, area);
-			sg = div64_s64(w0 * a->lg + w1 * b->lg + w2 * c->lg, area);
-			sb = div64_s64(w0 * a->lb + w1 * b->lb + w2 * c->lb, area);
-			spec = dnpr_specular(w0, w1, w2, area, a, b, c);
+			sr = ((u64)q0 * a->lr + (u64)q1 * b->lr +
+			      (u64)q2 * c->lr) >> 16;
+			sg = ((u64)q0 * a->lg + (u64)q1 * b->lg +
+			      (u64)q2 * c->lg) >> 16;
+			sb = ((u64)q0 * a->lb + (u64)q1 * b->lb +
+			      (u64)q2 * c->lb) >> 16;
+			nx = ((s64)q0 * a->nx + (s64)q1 * b->nx +
+			      (s64)q2 * c->nx) / 65536;
+			ny = ((s64)q0 * a->ny + (s64)q1 * b->ny +
+			      (s64)q2 * c->ny) / 65536;
+			nz = ((s64)q0 * a->nz + (s64)q1 * b->nz +
+			      (s64)q2 * c->nz) / 65536;
+			spec = dnpr_specular(nx, ny, nz);
 			r = min(255U, (tri->r * sr >> 8) + spec);
 			g = min(255U, (tri->g * sg >> 8) + spec);
 			blue = min(255U, (tri->blue * sb >> 8) + spec);
 			dnpr_base[index] = dnpr_rgb565(r, g, blue);
+	next_pixel:
+			w0 += step0;
+			w1 += step1;
 		}
+		row0 += (s64)sign * (b->x - c->x);
+		row1 += (s64)sign * (c->x - a->x);
 	}
 }
 
@@ -679,6 +696,9 @@ void dnpr_panic_animate(void)
 
 int __init dnpr_panic_init(void)
 {
+	unsigned int i, j;
+	u64 q;
+
 	if (dnpr_frame_meta.magic0 != 0x52504e44u || /* "DNPR" */
 	    dnpr_frame_meta.magic1 != 0x3130304bu || /* "K001" */
 	    dnpr_frame_meta.base_w != DNPR_WIDTH ||
@@ -706,6 +726,14 @@ int __init dnpr_panic_init(void)
 	    zlib_inflate_blob(dnpr_live_data, DNPR_LIVE_BYTES, dnpr_live_deflate,
 			      sizeof(dnpr_live_deflate)) != DNPR_LIVE_BYTES)
 		goto fail;
+	for (i = 0; i < DNPR_NORMAL_LENGTHS; i++)
+		dnpr_normal_lengths[i] = int_sqrt64(i);
+	for (i = 0; i < ARRAY_SIZE(dnpr_specular_levels); i++) {
+		q = (u64)i * 65536 / 127;
+		for (j = 0; j < 7; j++)
+			q = q * q >> 16;
+		dnpr_specular_levels[i] = 90 * q >> 16;
+	}
 	WRITE_ONCE(dnpr_ready, true);
 	pr_info("DNPR panic scene preloaded (%zu KiB base + sprite layers); "
 		"select drm.panic_screen=dnpr\n", DNPR_SCENE_BYTES / 1024);
