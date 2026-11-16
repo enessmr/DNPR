@@ -67,6 +67,8 @@ struct dnpr_sprite {
 static u16 *dnpr_base;
 static u8 *dnpr_layers;
 static u8 *dnpr_row;
+static u32 *dnpr_shared_frame;
+static bool dnpr_shared_valid;
 static bool dnpr_ready;
 
 /* Quantized 3D geometry. Positions are signed Q8 model coordinates; RGB
@@ -91,6 +93,10 @@ struct dnpr_projected {
 	s8 nx, ny, nz;
 };
 
+struct dnpr_rect {
+	unsigned int x0, y0, x1, y1;
+};
+
 #define DNPR_LIVE_BYTES (DNPR_BASE_BYTES + \
 	DNPR_LIVE_NT * sizeof(struct dnpr_live_triangle) + \
 	DNPR_LIVE_NF * DNPR_LIVE_NV * sizeof(struct dnpr_live_vertex))
@@ -99,6 +105,9 @@ static u8 *dnpr_live_data;
 static u16 *dnpr_live_depth;
 static struct dnpr_projected dnpr_projected[DNPR_LIVE_NV];
 static unsigned int dnpr_last_pose = ~0U;
+static struct {
+	int x0, y0, x1, y1;
+} dnpr_head_bounds, dnpr_head_dirty;
 
 static s64 dnpr_edge(s32 ax, s32 ay, s32 bx, s32 by, s32 x, s32 y)
 {
@@ -178,15 +187,16 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 	}
 }
 
-static void dnpr_render_live_head(unsigned int elapsed_ms)
+static bool dnpr_render_live_head(unsigned int elapsed_ms)
 {
 	const struct dnpr_live_triangle *tris;
 	const struct dnpr_live_vertex *verts;
 	unsigned int pose = min_t(u64, (u64)elapsed_ms * 30 / 1000,
 				  DNPR_LIVE_NF - 1), i;
+	int x0 = DNPR_WIDTH, y0 = DNPR_HEIGHT, x1 = 0, y1 = 0;
 
 	if (pose == dnpr_last_pose)
-		return;
+		return false;
 	dnpr_last_pose = pose;
 	memcpy(dnpr_base, dnpr_live_data, DNPR_BASE_BYTES);
 	memset(dnpr_live_depth, 0xff, DNPR_BASE_BYTES);
@@ -205,7 +215,23 @@ static void dnpr_render_live_head(unsigned int elapsed_ms)
 			.lr = verts[i].lr, .lg = verts[i].lg, .lb = verts[i].lb,
 			.nx = verts[i].nx, .ny = verts[i].ny, .nz = verts[i].nz,
 		};
+		x0 = min(x0, dnpr_projected[i].x);
+		y0 = min(y0, dnpr_projected[i].y);
+		x1 = max(x1, dnpr_projected[i].x);
+		y1 = max(y1, dnpr_projected[i].y);
 	}
+	x0 = clamp(x0 - 2, 0, (int)DNPR_WIDTH);
+	y0 = clamp(y0 - 2, 0, (int)DNPR_HEIGHT);
+	x1 = clamp(x1 + 3, 0, (int)DNPR_WIDTH);
+	y1 = clamp(y1 + 3, 0, (int)DNPR_HEIGHT);
+	dnpr_head_dirty.x0 = min(x0, dnpr_head_bounds.x0);
+	dnpr_head_dirty.y0 = min(y0, dnpr_head_bounds.y0);
+	dnpr_head_dirty.x1 = max(x1, dnpr_head_bounds.x1);
+	dnpr_head_dirty.y1 = max(y1, dnpr_head_bounds.y1);
+	dnpr_head_bounds.x0 = x0;
+	dnpr_head_bounds.y0 = y0;
+	dnpr_head_bounds.x1 = x1;
+	dnpr_head_bounds.y1 = y1;
 	for (i = 0; i < DNPR_LIVE_NT; i++) {
 		const struct dnpr_live_triangle *t = &tris[i];
 
@@ -216,6 +242,7 @@ static void dnpr_render_live_head(unsigned int elapsed_ms)
 					&dnpr_projected[t->b],
 					&dnpr_projected[t->c], t);
 	}
+	return true;
 }
 
 /* Panic-time animation state. Every plane that reports a scanout buffer
@@ -409,28 +436,128 @@ static void dnpr_composite_rect(struct drm_scanout_buffer *sb,
 	}
 }
 
+static unsigned int dnpr_regions(unsigned int width, unsigned int height,
+				 bool initial, bool head_changed,
+				 struct dnpr_rect out[4])
+{
+	if (initial) {
+		out[0] = (struct dnpr_rect){ 0, 0, width, height };
+		return 1;
+	}
+	if (head_changed) {
+		unsigned int x0 = clamp_t(int,
+			dnpr_head_dirty.x0 * width / DNPR_WIDTH - 2, 0, width);
+		unsigned int y0 = clamp_t(int,
+			dnpr_head_dirty.y0 * height / DNPR_HEIGHT - 2, 0, height);
+		unsigned int x1 = min(width,
+			DIV_ROUND_UP(dnpr_head_dirty.x1 * width, DNPR_WIDTH) + 2);
+		unsigned int y1 = min(height,
+			DIV_ROUND_UP(dnpr_head_dirty.y1 * height, DNPR_HEIGHT) + 2);
+
+		out[0] = (struct dnpr_rect){ x0, y0, x1, y1 };
+	}
+	/* Restore and redraw animated overlays; the rest remains on scanout. */
+	out[head_changed] = (struct dnpr_rect){ 0, height * 70 / 100,
+						   width / 2, height };
+	out[head_changed + 1] = (struct dnpr_rect){ width * 80 / 100, 0,
+						       width, height * 30 / 100 };
+	out[head_changed + 2] = (struct dnpr_rect){ 0, 0,
+						       min(width, 320U),
+						       min(height, 4U) };
+	return head_changed + 3;
+}
+
 static void dnpr_composite(struct drm_scanout_buffer *sb,
-			   unsigned int elapsed_ms, unsigned int frame)
+			   unsigned int elapsed_ms, unsigned int frame,
+			   bool initial, bool head_changed)
 {
 	struct dnpr_sprite sprites[DNPR_MAX_SPRITES];
-	unsigned int n;
-	unsigned int width = sb->width, height = sb->height;
+	struct dnpr_rect rects[4];
+	unsigned int n, nr, i;
 
-	dnpr_render_live_head(elapsed_ms);
-	n = dnpr_place_sprites(elapsed_ms, width, height, sprites);
-	if (elapsed_ms <= 4500) {
-		dnpr_composite_rect(sb, sprites, n, frame, 0, 0, width, height);
-		return;
+	n = dnpr_place_sprites(elapsed_ms, sb->width, sb->height, sprites);
+	nr = dnpr_regions(sb->width, sb->height, initial, head_changed, rects);
+	for (i = 0; i < nr; i++)
+		dnpr_composite_rect(sb, sprites, n, frame, rects[i].x0,
+				    rects[i].y0, rects[i].x1, rects[i].y1);
+}
+
+/* Compose 1080p pixels once. Both connected monitors currently use this
+ * resolution, so their refresh rates do not require separate scene work.
+ */
+static void dnpr_render_shared_rect(const struct dnpr_sprite *sprites,
+				    unsigned int n, unsigned int frame,
+				    const struct dnpr_rect *rect)
+{
+	unsigned int x, y;
+	unsigned int bar_w = ((frame % 40) + 1) * 8;
+
+	for (y = rect->y0; y < rect->y1; y++) {
+		const struct dnpr_sprite *active[DNPR_MAX_SPRITES];
+		unsigned int row_n = 0, i;
+
+		for (i = 0; i < n; i++)
+			if (y >= sprites[i].top && y < sprites[i].top + sprites[i].size)
+				active[row_n++] = &sprites[i];
+		for (x = rect->x0; x < rect->x1; x++) {
+			unsigned int r, g, b;
+
+			dnpr_sample_base(x, y, DNPR_WIDTH, DNPR_HEIGHT, &r, &g, &b);
+			for (i = 0; i < row_n; i++)
+				dnpr_blend_sprite(active[i], x, y, &r, &g, &b);
+			if (y < 4 && x < bar_w) {
+				r = 255;
+				g = 0;
+				b = 255;
+			}
+			dnpr_shared_frame[(size_t)y * DNPR_WIDTH + x] =
+				(r << 16) | (g << 8) | b;
+		}
 	}
-	/* Once Mario reaches the sigh pose, only these overlay regions change.
-	 * Rebuild them from the cached base instead of rewriting both screens.
-	 */
-	dnpr_composite_rect(sb, sprites, n, frame, 0, height * 70 / 100,
-			    width / 2, height);
-	dnpr_composite_rect(sb, sprites, n, frame, width * 80 / 100, 0,
-			    width, height * 30 / 100);
-	dnpr_composite_rect(sb, sprites, n, frame, 0, 0,
-			    min(width, 320U), min(height, 4U));
+}
+
+static void dnpr_render_shared(unsigned int elapsed_ms, unsigned int frame,
+			       bool initial, bool head_changed)
+{
+	struct dnpr_sprite sprites[DNPR_MAX_SPRITES];
+	struct dnpr_rect rects[4];
+	unsigned int n, nr, i;
+
+	n = dnpr_place_sprites(elapsed_ms, DNPR_WIDTH, DNPR_HEIGHT, sprites);
+	nr = dnpr_regions(DNPR_WIDTH, DNPR_HEIGHT, initial, head_changed, rects);
+	for (i = 0; i < nr; i++)
+		dnpr_render_shared_rect(sprites, n, frame, &rects[i]);
+	dnpr_shared_valid = true;
+}
+
+static void dnpr_blit_shared(struct drm_scanout_buffer *sb, bool initial,
+			     bool head_changed)
+{
+	struct dnpr_rect rects[4];
+	unsigned int nr, i, x, y, cpp = sb->format->cpp[0];
+	void (*set_pixel)(struct drm_scanout_buffer *, unsigned int, unsigned int,
+			  u32) = sb->set_pixel;
+
+	nr = dnpr_regions(DNPR_WIDTH, DNPR_HEIGHT, initial, head_changed, rects);
+	for (i = 0; i < nr; i++) {
+		for (y = rects[i].y0; y < rects[i].y1; y++) {
+			for (x = rects[i].x0; x < rects[i].x1; x++) {
+				u32 rgb = dnpr_shared_frame[(size_t)y * DNPR_WIDTH + x];
+				u32 color = drm_draw_color_from_xrgb8888(rgb,
+								  sb->format->format);
+
+				if (set_pixel)
+					set_pixel(sb, x, y, color);
+				else
+					memcpy(dnpr_row + x * cpp, &color, cpp);
+			}
+			if (!set_pixel)
+				iosys_map_memcpy_to(&sb->map[0],
+					(size_t)y * sb->pitch[0] + rects[i].x0 * cpp,
+					dnpr_row + rects[i].x0 * cpp,
+					(rects[i].x1 - rects[i].x0) * cpp);
+		}
+	}
 }
 
 static bool dnpr_scanout_ok(struct drm_scanout_buffer *sb)
@@ -464,29 +591,67 @@ bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 		idx = DNPR_MAX_SB - 1;
 	dnpr_sb[idx] = *sb;
 	WRITE_ONCE(dnpr_sb_valid[idx], true);
-	dnpr_composite(&dnpr_sb[idx], 0, 0);
+	dnpr_render_live_head(0);
+	if (dnpr_shared_frame && sb->width == DNPR_WIDTH &&
+	    sb->height == DNPR_HEIGHT) {
+		if (!dnpr_shared_valid)
+			dnpr_render_shared(0, 0, true, true);
+		dnpr_blit_shared(&dnpr_sb[idx], true, true);
+	} else {
+		dnpr_composite(&dnpr_sb[idx], 0, 0, true, true);
+	}
 	wmb();
 	return true;
 }
 
 void dnpr_panic_animate(void)
 {
-	u64 start_ns;
+	u64 start_ns, next_ns, now_ns, wait_us;
 	unsigned int k, elapsed_ms;
+	bool head_changed;
+	bool native_scanout = false;
 
 	if (!READ_ONCE(dnpr_sb_count))
 		return;
 	start_ns = ktime_get_mono_fast_ns();
+	next_ns = start_ns + 33333333ULL;
 	dnpr_audio_start();
 	for (;;) {
-		mdelay(80);
+		now_ns = ktime_get_mono_fast_ns();
+		if (now_ns < next_ns) {
+			wait_us = (next_ns - now_ns) / 1000;
+			if (wait_us >= 1000)
+				mdelay(wait_us / 1000);
+			if (wait_us % 1000)
+				udelay(wait_us % 1000);
+		}
+		now_ns = ktime_get_mono_fast_ns();
+		next_ns = now_ns + 33333333ULL;
 		elapsed_ms = min_t(u64,
-			(ktime_get_mono_fast_ns() - start_ns) / 1000000,
+			(now_ns - start_ns) / 1000000,
 			~0U);
 		dnpr_frame++;
+		head_changed = dnpr_render_live_head(elapsed_ms);
 		for (k = 0; k < dnpr_sb_count; k++)
-			if (READ_ONCE(dnpr_sb_valid[k]))
-				dnpr_composite(&dnpr_sb[k], elapsed_ms, dnpr_frame);
+			if (READ_ONCE(dnpr_sb_valid[k]) &&
+			    dnpr_sb[k].width == DNPR_WIDTH &&
+			    dnpr_sb[k].height == DNPR_HEIGHT)
+				native_scanout = true;
+		if (native_scanout && dnpr_shared_frame)
+			dnpr_render_shared(elapsed_ms, dnpr_frame, false,
+					   head_changed);
+		for (k = 0; k < dnpr_sb_count; k++)
+			if (READ_ONCE(dnpr_sb_valid[k])) {
+				if (dnpr_shared_frame &&
+				    dnpr_sb[k].width == DNPR_WIDTH &&
+				    dnpr_sb[k].height == DNPR_HEIGHT)
+					dnpr_blit_shared(&dnpr_sb[k], false,
+							 head_changed);
+				else
+					dnpr_composite(&dnpr_sb[k], elapsed_ms,
+						       dnpr_frame, false,
+						       head_changed);
+			}
 		wmb();
 		dnpr_audio_maybe_stop();
 	}
@@ -508,6 +673,7 @@ int __init dnpr_panic_init(void)
 
 	dnpr_base = vmalloc(DNPR_SCENE_BYTES);
 	dnpr_row = kmalloc(DNPR_MAX_WIDTH * 4, GFP_KERNEL);
+	dnpr_shared_frame = vmalloc(DNPR_BASE_BYTES * 2);
 	if (!dnpr_base || !dnpr_row)
 		goto fail;
 	if (zlib_inflate_blob(dnpr_base, DNPR_SCENE_BYTES, dnpr_frame_deflate,
@@ -534,6 +700,8 @@ fail:
 	dnpr_base = NULL;
 	kfree(dnpr_row);
 	dnpr_row = NULL;
+	vfree(dnpr_shared_frame);
+	dnpr_shared_frame = NULL;
 	return -ENOMEM;
 }
 
@@ -547,11 +715,14 @@ void dnpr_panic_exit(void)
 	vfree(dnpr_live_data);
 	dnpr_live_data = NULL;
 	memset(dnpr_sb_valid, 0, sizeof(dnpr_sb_valid));
+	dnpr_shared_valid = false;
 	vfree(dnpr_base);
 	dnpr_base = NULL;
 	dnpr_layers = NULL;
 	kfree(dnpr_row);
 	dnpr_row = NULL;
+	vfree(dnpr_shared_frame);
+	dnpr_shared_frame = NULL;
 }
 
 MODULE_LICENSE("GPL");
