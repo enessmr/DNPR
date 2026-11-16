@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <SDL.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <math.h>
 #include <pthread.h>
@@ -11,9 +12,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <xf86drmMode.h>
 
 static int screen_w=1920,screen_h=1080;
 #define W screen_w
@@ -30,6 +33,12 @@ typedef struct { float x,y,z,invz,lr,lg,lb,nx,ny,nz; } Projected;
 
 static Mesh mesh;
 static uint32_t *pixels,*background,*final_head_cache;
+static struct {
+    int fd;
+    uint32_t handle,pitch;
+    size_t size;
+    void *map;
+} drm_buffer={.fd=-1};
 static float *depth;
 static pthread_t raster_workers[15];
 static pthread_mutex_t raster_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -147,6 +156,47 @@ static bool init_buffers(int width,int height){
         }
     }
     return true;
+}
+
+/* Allocate a CPU-mappable DRM image without becoming DRM master or changing
+ * either monitor's mode. Keep a RAM source image: reads from NVIDIA's mapped
+ * video memory are far too slow for SDL's window-surface presentation.
+ */
+static bool init_drm_buffer(void){
+    glob_t cards={0};
+    if(glob("/dev/dri/card[0-9]*",0,NULL,&cards)!=0)return false;
+    for(size_t i=0;i<cards.gl_pathc;i++){
+        int fd=open(cards.gl_pathv[i],O_RDWR|O_CLOEXEC);
+        uint32_t handle=0,pitch=0;
+        uint64_t size=0,offset=0;
+        if(fd<0)continue;
+        if(drmModeCreateDumbBuffer(fd,W,H,32,0,&handle,&pitch,&size)!=0){close(fd);continue;}
+        if(pitch!=(uint32_t)W*4 || size<(uint64_t)pitch*H ||
+           drmModeMapDumbBuffer(fd,handle,&offset)!=0){
+            drmModeDestroyDumbBuffer(fd,handle);close(fd);continue;
+        }
+        void *map=mmap(NULL,(size_t)size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,(off_t)offset);
+        if(map==MAP_FAILED){drmModeDestroyDumbBuffer(fd,handle);close(fd);continue;}
+        drm_buffer.fd=fd;
+        drm_buffer.handle=handle;
+        drm_buffer.pitch=pitch;
+        drm_buffer.size=(size_t)size;
+        drm_buffer.map=map;
+        fprintf(stderr,"DNPR: mapped DRM scanout copy on %s\n",cards.gl_pathv[i]);
+        globfree(&cards);
+        return true;
+    }
+    globfree(&cards);
+    return false;
+}
+
+static void release_drm_buffer(void){
+    if(!drm_buffer.map)return;
+    munmap(drm_buffer.map,drm_buffer.size);
+    drmModeDestroyDumbBuffer(drm_buffer.fd,drm_buffer.handle);
+    close(drm_buffer.fd);
+    drm_buffer.map=NULL;
+    drm_buffer.fd=-1;
 }
 
 static void pose_head(int frame,int next,float frac){
@@ -480,7 +530,7 @@ static int save_ppm(const char *path){
     for(int i=0;i<W*H;i++){uint8_t c[]={pixels[i]>>16,pixels[i]>>8,pixels[i]};fwrite(c,1,3,f);}
     fclose(f);return 0;
 }
-static void usage(void){puts("dnpr-test [--no-audio] [--static] [--animation] [--display N]\n"
+static void usage(void){puts("dnpr-test [--no-audio] [--no-drm-buffer] [--static] [--animation] [--display N]\n"
     "          [--stop] [--status] [--displays] [--render-frame FILE]\n"
     "          [--render-base-frame FILE] [--frame N]\n"
     "Escape exits. Preview uses a compositor-managed fullscreen window.");}
@@ -522,6 +572,7 @@ static bool acer_display(int index){
 
 int main(int argc,char **argv){
     bool with_audio=true,static_frame=false,animation_only=false,displays=false;
+    bool drm_copy=true;
     const char *render_path=NULL,*base_path=NULL;int display=-1;char command=0;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--audio"))with_audio=true;
@@ -529,6 +580,7 @@ int main(int argc,char **argv){
         else if(!strcmp(argv[i],"--static"))static_frame=true;
         else if(!strcmp(argv[i],"--animation"))animation_only=true;
         else if(!strcmp(argv[i],"--displays"))displays=true;
+        else if(!strcmp(argv[i],"--no-drm-buffer"))drm_copy=false;
         else if(!strcmp(argv[i],"--status"))command='s';
         else if(!strcmp(argv[i],"--stop"))command='q';
         else if(!strcmp(argv[i],"--display")&&i+1<argc)display=atoi(argv[++i]);
@@ -571,11 +623,16 @@ int main(int argc,char **argv){
         SDL_WINDOWPOS_CENTERED_DISPLAY(display),bounds.w,bounds.h,
         SDL_WINDOW_BORDERLESS|SDL_WINDOW_FULLSCREEN_DESKTOP|SDL_WINDOW_ALLOW_HIGHDPI);
     if(!win){fprintf(stderr,"Window: %s\n",SDL_GetError());goto fail;}
-    SDL_Renderer *renderer=SDL_CreateRenderer(win,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
-    if(!renderer)renderer=SDL_CreateRenderer(win,-1,SDL_RENDERER_SOFTWARE);
-    if(!renderer){fprintf(stderr,"Renderer: %s\n",SDL_GetError());SDL_DestroyWindow(win);goto fail;}
-    SDL_Texture *texture=SDL_CreateTexture(renderer,SDL_PIXELFORMAT_ARGB8888,SDL_TEXTUREACCESS_STREAMING,W,H);
-    if(!texture){fprintf(stderr,"Texture: %s\n",SDL_GetError());SDL_DestroyRenderer(renderer);SDL_DestroyWindow(win);goto fail;}
+    if(drm_copy&&!init_drm_buffer())
+        fputs("DNPR: mapped DRM buffer unavailable; using the RAM image\n",stderr);
+    SDL_Surface *window_surface=SDL_GetWindowSurface(win);
+    SDL_Surface *image=SDL_CreateRGBSurfaceFrom(pixels,W,H,32,W*4,
+        0x00ff0000u,0x0000ff00u,0x000000ffu,0xff000000u);
+    if(!window_surface||!image){
+        fprintf(stderr,"Window surface: %s\n",SDL_GetError());
+        if(image)SDL_FreeSurface(image);
+        release_drm_buffer();SDL_DestroyWindow(win);goto fail;
+    }
     raster_init();
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"0");
     uint32_t audio_pos=0;SDL_AudioDeviceID audio=0;
@@ -586,6 +643,7 @@ int main(int argc,char **argv){
     }
     signal(SIGINT,on_signal);signal(SIGTERM,on_signal);
     uint64_t start=SDL_GetPerformanceCounter();double freq=(double)SDL_GetPerformanceFrequency();
+    unsigned debug_frame=0;
     while(running){
         SDL_Event event;while(SDL_PollEvent(&event)){
             if(event.type==SDL_QUIT||(event.type==SDL_KEYDOWN&&event.key.keysym.sym==SDLK_ESCAPE))running=0;
@@ -594,13 +652,24 @@ int main(int argc,char **argv){
         poll_control();
         double sec=(SDL_GetPerformanceCounter()-start)/freq;
         frame(sec,static_frame,animation_only,true);
-        SDL_UpdateTexture(texture,NULL,pixels,W*sizeof(uint32_t));
-        SDL_RenderClear(renderer);SDL_RenderCopy(renderer,texture,NULL,NULL);SDL_RenderPresent(renderer);
+        /* Same top-left magenta frame counter as the panic compositor. */
+        unsigned bar_w=((++debug_frame%40)+1)*8;
+        if(bar_w>(unsigned)W)bar_w=(unsigned)W;
+        for(unsigned y=0;y<4&&y<(unsigned)H;y++)
+            for(unsigned x=0;x<bar_w;x++)pixels[(size_t)y*W+x]=rgb(255,0,255);
+        if(drm_buffer.map)
+            memcpy(drm_buffer.map,pixels,(size_t)W*H*sizeof(*pixels));
+        /* Fullscreen settling can invalidate SDL's window surface. */
+        window_surface=SDL_GetWindowSurface(win);
+        if(!window_surface||SDL_BlitScaled(image,NULL,window_surface,NULL)!=0||
+           SDL_UpdateWindowSurface(win)!=0){
+            fprintf(stderr,"Window present: %s\n",SDL_GetError());break;
+        }
         SDL_Delay(1);
     }
     if(audio)SDL_CloseAudioDevice(audio);
     raster_shutdown();
-    SDL_DestroyTexture(texture);SDL_DestroyRenderer(renderer);SDL_DestroyWindow(win);
+    SDL_FreeSurface(image);release_drm_buffer();SDL_DestroyWindow(win);
 fail:
     close(server_fd);unlink(socket_path);SDL_Quit();
     free(pixels);free(background);free(final_head_cache);free(depth);

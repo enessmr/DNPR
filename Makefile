@@ -1,7 +1,7 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Wpedantic $(shell pkg-config --cflags sdl2) -pthread
-LDLIBS += $(shell pkg-config --libs sdl2) -lm -pthread
+CFLAGS += -std=c11 -Wall -Wextra -Wpedantic $(shell pkg-config --cflags sdl2 libdrm) -pthread
+LDLIBS += $(shell pkg-config --libs sdl2 libdrm) -lm -pthread
 SUPERGODOT64_ROOT ?= /mnt/nvme/SuperGodot64
 
 all: dnpr-test
@@ -23,6 +23,7 @@ kernel-assets: dnpr-test export_panic_scene.py export_panic_mesh.py export_panic
 	python3 export_panic_scene.py .dnpr-panic-base.ppm scene.bin kernel/dnpr_frame_blob.h
 	python3 export_panic_mesh.py mario_head.bin scene.bin kernel/dnpr_live_blob.h
 	python3 export_panic_audio.py --input gameover_audio.bin --output kernel/dnpr_audio_blob.h
+	python3 gen_spec_lut.py
 	rm .dnpr-panic-base.ppm
 
 clean:

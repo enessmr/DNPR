@@ -40,6 +40,7 @@
 #include "dnpr_audio.h"
 #include "dnpr_frame_blob.h"
 #include "dnpr_live_blob.h"
+#include "dnpr_spec_blob.h"
 
 #define DNPR_WIDTH 1920U
 #define DNPR_HEIGHT 1080U
@@ -139,6 +140,7 @@ struct dnpr_rect {
 
 static u8 *dnpr_live_data;
 static u16 *dnpr_live_depth;
+static u8 *dnpr_spec_lut;
 static struct dnpr_projected dnpr_projected[DNPR_LIVE_NV];
 static u64 dnpr_last_pose_q = ~0ULL;
 static struct {
@@ -184,10 +186,17 @@ static unsigned int dnpr_specular(s64 w0, s64 w1, s64 w2, s64 area,
 				    area, reciprocal);
 	s64 nz = dnpr_div_by_area(w0 * a->nz + w1 * b->nz + w2 * c->nz,
 				    area, reciprocal);
-	u64 length = int_sqrt64(nx * nx + ny * ny + nz * nz);
-	s64 h = length ? (-59 * nx + 41 * ny + 106 * nz) / length : 0;
-	u64 q;
+	u64 length, q;
+	s64 h;
 	int i;
+
+	if (dnpr_spec_lut && nx >= -128 && nx <= 127 &&
+	    ny >= -128 && ny <= 127 && nz >= -128 && nz <= 127)
+		return dnpr_spec_lut[((unsigned int)(nx + 128) << 16) |
+				     ((unsigned int)(ny + 128) << 8) |
+				     (unsigned int)(nz + 128)];
+	length = int_sqrt64(nx * nx + ny * ny + nz * nz);
+	h = length ? (-59 * nx + 41 * ny + 106 * nz) / (s64)length : 0;
 
 	if (h <= 0)
 		return 0;
@@ -1009,11 +1018,22 @@ int __init dnpr_panic_init(void)
 	    zlib_inflate_blob(dnpr_live_data, DNPR_LIVE_BYTES, dnpr_live_deflate,
 			      sizeof(dnpr_live_deflate)) != DNPR_LIVE_BYTES)
 		goto fail;
+	dnpr_spec_lut = vmalloc(1U << 24);
+	if (dnpr_spec_lut &&
+	    zlib_inflate_blob(dnpr_spec_lut, 1U << 24, dnpr_spec_deflate,
+			      sizeof(dnpr_spec_deflate)) != (1U << 24)) {
+		vfree(dnpr_spec_lut);
+		dnpr_spec_lut = NULL;
+	}
+	if (!dnpr_spec_lut)
+		pr_warn("DNPR highlight lookup unavailable; using arithmetic fallback\n");
 	WRITE_ONCE(dnpr_ready, true);
 	pr_info("DNPR panic scene preloaded (%zu KiB base + sprite layers); "
 		"select drm.panic_screen=dnpr\n", DNPR_SCENE_BYTES / 1024);
 	return 0;
 fail:
+	vfree(dnpr_spec_lut);
+	dnpr_spec_lut = NULL;
 	vfree(dnpr_live_depth);
 	dnpr_live_depth = NULL;
 	vfree(dnpr_live_data);
@@ -1033,6 +1053,8 @@ fail:
 void dnpr_panic_exit(void)
 {
 	WRITE_ONCE(dnpr_ready, false);
+	vfree(dnpr_spec_lut);
+	dnpr_spec_lut = NULL;
 	dnpr_sb_count = 0;
 	dnpr_frame = 0;
 	vfree(dnpr_live_depth);
