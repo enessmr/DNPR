@@ -865,7 +865,10 @@ void dnpr_panic_animate(void)
 			native_scanout = true;
 	start_ns = ktime_get_mono_fast_ns();
 	next_ns = start_ns + DNPR_FASTEST_FRAME_NS;
-	dnpr_raster_start_helpers();
+	/* panic() stopped the other CPUs before the DRM kmsg dumper reached us.
+	 * x86 marks them offline, so the helper startup would return without
+	 * dispatching work. Keep the boot-time SMP selftest separate.
+	 */
 	dnpr_audio_start();
 	for (;;) {
 		now_ns = ktime_get_mono_fast_ns();
