@@ -1,0 +1,114 @@
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -39,6 +39,11 @@
+ #include <trace/events/error_report.h>
+ #include <asm/sections.h>
+ 
++#ifdef CONFIG_DRM_DNPR
++extern bool drm_panic_dnpr_smp_arm(void);
++extern void drm_panic_dnpr_smp_finish(void);
++#endif
++
+ #define PANIC_TIMER_STEP 100
+ #define PANIC_BLINK_SPD 18
+ 
+@@ -292,6 +297,9 @@
+ 	int state = 0;
+ 	int old_cpu, this_cpu;
+ 	bool _crash_kexec_post_notifiers = crash_kexec_post_notifiers;
++#ifdef CONFIG_DRM_DNPR
++	bool dnpr_smp_armed = false;
++#endif
+ 
+ 	if (panic_on_warn) {
+ 		/*
+@@ -372,7 +380,16 @@
+ 	if (!_crash_kexec_post_notifiers)
+ 		__crash_kexec(NULL);
+ 
++#ifdef CONFIG_DRM_DNPR
++	if (!_crash_kexec_post_notifiers &&
++	    !(panic_print & PANIC_PRINT_ALL_CPU_BT))
++		dnpr_smp_armed = drm_panic_dnpr_smp_arm();
++#endif
+ 	panic_other_cpus_shutdown(_crash_kexec_post_notifiers);
++#ifdef CONFIG_DRM_DNPR
++	if (dnpr_smp_armed)
++		drm_panic_dnpr_smp_finish();
++#endif
+ 
+ 	printk_legacy_allow_panic_sync();
+ 
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -118,6 +118,11 @@
+ static atomic_t stopping_cpu = ATOMIC_INIT(-1);
+ static bool smp_no_nmi_ipi = false;
+ 
++#ifdef CONFIG_DRM_DNPR
++extern bool dnpr_panic_smp_armed(void);
++extern void dnpr_panic_smp_worker(void);
++#endif
++
+ static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
+ {
+ 	/* We are registered on stopping cpu too, avoid spurious NMI */
+@@ -137,6 +142,10 @@
+ {
+ 	apic_eoi();
+ 	cpu_emergency_disable_virtualization();
++#ifdef CONFIG_DRM_DNPR
++	if (dnpr_panic_smp_armed())
++		dnpr_panic_smp_worker();
++#endif
+ 	stop_this_cpu(NULL);
+ }
+ 
+@@ -229,10 +238,19 @@
+ 			udelay(1);
+ 	}
+ 
+-	local_irq_save(flags);
+-	disable_local_APIC();
+-	mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
+-	local_irq_restore(flags);
++	/* DNPR helpers remain online in the reboot-vector callback. Keep the
++	 * panic CPU's APIC live so a stalled helper can receive a later stop. */
++#ifdef CONFIG_DRM_DNPR
++	if (dnpr_panic_smp_armed()) {
++		atomic_set(&stopping_cpu, -1);
++	} else
++#endif
++	{
++		local_irq_save(flags);
++		disable_local_APIC();
++		mcheck_cpu_clear(this_cpu_ptr(&cpu_info));
++		local_irq_restore(flags);
++	}
+ 
+ 	/*
+ 	 * Ensure that the cpus_stop_mask cache lines are invalidated on
+--- a/drivers/gpu/drm/drm_panic.c
++++ b/drivers/gpu/drm/drm_panic.c
+@@ -42,6 +42,21 @@
+ 
+ static char drm_panic_screen[16] = CONFIG_DRM_PANIC_SCREEN;
+ module_param_string(panic_screen, drm_panic_screen, sizeof(drm_panic_screen), 0644);
++
++#ifdef CONFIG_DRM_DNPR
++bool drm_panic_dnpr_smp_arm(void);
++void drm_panic_dnpr_smp_finish(void);
++
++bool drm_panic_dnpr_smp_arm(void)
++{
++	return !strcmp(drm_panic_screen, "dnpr") && dnpr_panic_smp_arm();
++}
++
++void drm_panic_dnpr_smp_finish(void)
++{
++	dnpr_panic_smp_finish();
++}
++#endif
+ MODULE_PARM_DESC(panic_screen,
+ 		 "Choose what will be displayed by drm_panic, 'user' or 'kmsg' [default="
+ 		 CONFIG_DRM_PANIC_SCREEN "]");

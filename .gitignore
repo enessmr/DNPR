@@ -1,5 +1,6 @@
 # Local game-derived inputs and generated outputs
 dnpr-test
+panic_sim.o
 mario_head.bin
 scene.bin
 gameover_audio.bin

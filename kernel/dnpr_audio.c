@@ -30,7 +30,12 @@
 #define DNPR_HDA_CODEC 0
 #define DNPR_HDA_FORMAT 0x0a11 /* 32 kHz, 16-bit, two channels */
 #define DNPR_HDA_CHUNK 4096U
-#define DNPR_HDA_ENTRIES DIV_ROUND_UP(DNPR_AUDIO_BYTES, DNPR_HDA_CHUNK)
+#define DNPR_HDA_PCM_ENTRIES DIV_ROUND_UP(DNPR_AUDIO_BYTES, DNPR_HDA_CHUNK)
+#define DNPR_HDA_SILENCE_ENTRIES 64U /* two seconds before the ring wraps */
+#define DNPR_HDA_ENTRIES (DNPR_HDA_PCM_ENTRIES + DNPR_HDA_SILENCE_ENTRIES)
+#define DNPR_HDA_RING_BYTES (DNPR_AUDIO_BYTES + \
+			     DNPR_HDA_SILENCE_ENTRIES * DNPR_HDA_CHUNK)
+#define DNPR_HDA_GAIN_DIVISOR 10 /* -20 dB relative to the preview cue */
 
 struct dnpr_hda_bdle {
 	__le32 addr_lo, addr_hi, length, flags;
@@ -38,44 +43,16 @@ struct dnpr_hda_bdle {
 
 static struct pci_dev *dnpr_hda_pci;
 static void __iomem *dnpr_hda_regs;
-static void *dnpr_hda_pcm[DNPR_HDA_ENTRIES];
-static dma_addr_t dnpr_hda_pcm_dma[DNPR_HDA_ENTRIES];
+static void *dnpr_hda_pcm[DNPR_HDA_PCM_ENTRIES];
+static dma_addr_t dnpr_hda_pcm_dma[DNPR_HDA_PCM_ENTRIES];
 static struct dnpr_hda_bdle *dnpr_hda_bdl;
 static dma_addr_t dnpr_hda_bdl_dma;
 static void *dnpr_hda_silence;
 static dma_addr_t dnpr_hda_silence_dma;
 static unsigned int dnpr_hda_stream_index;
-static unsigned int dnpr_hda_rewritten;
 static bool dnpr_hda_ready;
 static bool dnpr_hda_started;
 static u64 dnpr_hda_start_ns;
-
-/* Repoint every BDL entry the DMA has finished with at the silence page.
- * The controller runs the BDL cyclically, so unless RUN is cleared it wraps
- * to entry 0 and replays the cue from its (loud) opening; a late stop check
- * after the 12 fps ambient tick is exactly how extra audio appears at the
- * end. With consumed entries silenced, a wrap can only ever replay
- * silence, no matter how late the stop lands. Rewrites stop two entries
- * behind the reported position because the controller prefetches ahead. */
-static void dnpr_hda_silence_consumed(void __iomem *sd)
-{
-	unsigned int cur, safe, i;
-
-	if (!dnpr_hda_silence)
-		return;
-	cur = readl(sd + AZX_REG_SD_LPIB) / DNPR_HDA_CHUNK;
-	if (cur >= DNPR_HDA_ENTRIES) /* garbage position: leave the BDL alone */
-		return;
-	safe = cur > 2 ? cur - 2 : 0;
-	for (i = READ_ONCE(dnpr_hda_rewritten); i < safe; i++) {
-		dnpr_hda_bdl[i].addr_lo = cpu_to_le32(lower_32_bits(dnpr_hda_silence_dma));
-		dnpr_hda_bdl[i].addr_hi = cpu_to_le32(upper_32_bits(dnpr_hda_silence_dma));
-		dnpr_hda_bdl[i].length = cpu_to_le32(DNPR_HDA_CHUNK);
-		dnpr_hda_bdl[i].flags = 0;
-	}
-	if (safe > READ_ONCE(dnpr_hda_rewritten))
-		WRITE_ONCE(dnpr_hda_rewritten, safe);
-}
 
 static bool dnpr_hda_verb(unsigned int nid, unsigned int verb, unsigned int value)
 {
@@ -108,7 +85,6 @@ void dnpr_audio_start(void)
 
 	if (!READ_ONCE(dnpr_hda_ready) || dnpr_hda_started)
 		return;
-	dnpr_hda_started = true;
 	sd = dnpr_hda_regs + 0x80 + 0x20 * dnpr_hda_stream_index;
 	ctl = readl(sd + AZX_REG_SD_CTL) & ~SD_CTL_DMA_START;
 	writel(ctl, sd + AZX_REG_SD_CTL);
@@ -127,19 +103,6 @@ void dnpr_audio_start(void)
 	}
 	if (n == 100)
 		return;
-	/* A previous start may have silenced consumed entries; rebuild the
-	 * cue's BDL before this one. */
-	for (n = 0; n < DNPR_HDA_ENTRIES; n++) {
-		unsigned int length = min_t(unsigned int, DNPR_HDA_CHUNK,
-					    DNPR_AUDIO_BYTES - n * DNPR_HDA_CHUNK);
-
-		dnpr_hda_bdl[n].addr_lo = cpu_to_le32(lower_32_bits(dnpr_hda_pcm_dma[n]));
-		dnpr_hda_bdl[n].addr_hi = cpu_to_le32(upper_32_bits(dnpr_hda_pcm_dma[n]));
-		dnpr_hda_bdl[n].length = cpu_to_le32(length);
-		dnpr_hda_bdl[n].flags = 0;
-	}
-	WRITE_ONCE(dnpr_hda_rewritten, 0);
-
 	/* A direct stream is needed here: ALSA's normal start path can sleep or
 	 * wait on a lock held by a CPU already stopped by panic(). */
 	writeb(0, dnpr_hda_regs + AZX_REG_CORBCTL);
@@ -154,12 +117,13 @@ void dnpr_audio_start(void)
 
 	writel(lower_32_bits(dnpr_hda_bdl_dma), sd + AZX_REG_SD_BDLPL);
 	writel(upper_32_bits(dnpr_hda_bdl_dma), sd + AZX_REG_SD_BDLPU);
-	writel(DNPR_AUDIO_BYTES, sd + AZX_REG_SD_CBL);
+	writel(DNPR_HDA_RING_BYTES, sd + AZX_REG_SD_CBL);
 	writew(DNPR_HDA_ENTRIES - 1, sd + AZX_REG_SD_LVI);
 	writew(DNPR_HDA_FORMAT, sd + AZX_REG_SD_FORMAT);
 	writel((1U << SD_CTL_STREAM_TAG_SHIFT) | SD_CTL_DMA_START,
 	       sd + AZX_REG_SD_CTL);
 	dnpr_hda_start_ns = ktime_get_mono_fast_ns();
+	dnpr_hda_started = true;
 }
 
 void dnpr_audio_maybe_stop(void)
@@ -169,11 +133,9 @@ void dnpr_audio_maybe_stop(void)
 	if (!dnpr_hda_started || !dnpr_hda_regs || !dnpr_hda_start_ns)
 		return;
 	sd = dnpr_hda_regs + 0x80 + 0x20 * dnpr_hda_stream_index;
-	dnpr_hda_silence_consumed(sd);
-	/* The cue's audible content ends at 5.85 s and the last 150 ms are
-	 * digital silence, so stopping at 5.9 s cuts nothing a listener can
-	 * hear and beats the cyclic wrap at 6.0 s even when this check runs
-	 * a tick late. */
+	/* The cue's audible content ends before 5.9 s. The fixed silent tail
+	 * gives this stop check two additional seconds without modifying live
+	 * DMA descriptors. */
 	if (ktime_get_mono_fast_ns() - dnpr_hda_start_ns < 5900000000ULL)
 		return;
 	writel(readl(sd + AZX_REG_SD_CTL) & ~SD_CTL_DMA_START,
@@ -205,15 +167,13 @@ static int __init dnpr_hda_init(void)
 	dnpr_hda_bdl = dma_alloc_coherent(&dnpr_hda_pci->dev,
 					 sizeof(*dnpr_hda_bdl) * DNPR_HDA_ENTRIES,
 					 &dnpr_hda_bdl_dma, GFP_KERNEL);
-	/* A page of pure silence; consumed BDL entries are repointed here so
-	 * a cyclic wrap can never replay the cue. Failure only skips the
-	 * belt: the deadline stop still runs. */
+	/* A fixed silent tail avoids rewriting descriptors while DMA is live. */
 	dnpr_hda_silence = dma_alloc_coherent(&dnpr_hda_pci->dev, DNPR_HDA_CHUNK,
 					      &dnpr_hda_silence_dma, GFP_KERNEL);
 	if (dnpr_hda_silence)
 		memset(dnpr_hda_silence, 0, DNPR_HDA_CHUNK);
 	decoded = vmalloc(DNPR_AUDIO_BYTES);
-	if (!dnpr_hda_bdl || !decoded) {
+	if (!dnpr_hda_bdl || !dnpr_hda_silence || !decoded) {
 		pr_warn("DNPR: HDA PCM allocation failed\n");
 		goto fail;
 	}
@@ -223,7 +183,14 @@ static int __init dnpr_hda_init(void)
 		pr_warn("DNPR: HDA PCM decode failed\n");
 		goto fail;
 	}
-	for (i = 0; i < DNPR_HDA_ENTRIES; i++) {
+	/* Keep panic audio quieter than the SDL preview, including its voice. */
+	for (i = 0; i < DNPR_AUDIO_BYTES / sizeof(__le16); i++) {
+		__le16 *samples = (__le16 *)decoded;
+		s16 sample = (s16)le16_to_cpu(samples[i]);
+
+		samples[i] = cpu_to_le16(sample / DNPR_HDA_GAIN_DIVISOR);
+	}
+	for (i = 0; i < DNPR_HDA_PCM_ENTRIES; i++) {
 		unsigned int length = min_t(unsigned int, DNPR_HDA_CHUNK,
 						   DNPR_AUDIO_BYTES - i * DNPR_HDA_CHUNK);
 		dnpr_hda_pcm[i] = dma_alloc_coherent(&dnpr_hda_pci->dev,
@@ -237,13 +204,19 @@ static int __init dnpr_hda_init(void)
 		dnpr_hda_bdl[i].length = cpu_to_le32(length);
 		dnpr_hda_bdl[i].flags = 0;
 	}
+	for (; i < DNPR_HDA_ENTRIES; i++) {
+		dnpr_hda_bdl[i].addr_lo = cpu_to_le32(lower_32_bits(dnpr_hda_silence_dma));
+		dnpr_hda_bdl[i].addr_hi = cpu_to_le32(upper_32_bits(dnpr_hda_silence_dma));
+		dnpr_hda_bdl[i].length = cpu_to_le32(DNPR_HDA_CHUNK);
+		dnpr_hda_bdl[i].flags = 0;
+	}
 	vfree(decoded);
 	WRITE_ONCE(dnpr_hda_ready, true);
 	pr_info("DNPR: panic HDA PCM prepared for Microstep HDMI (32 kHz stereo)\n");
 	return 0;
 fail:
 	vfree(decoded);
-	for (i = 0; i < DNPR_HDA_ENTRIES; i++)
+	for (i = 0; i < DNPR_HDA_PCM_ENTRIES; i++)
 		if (dnpr_hda_pcm[i])
 			dma_free_coherent(&dnpr_hda_pci->dev, DNPR_HDA_CHUNK,
 					  dnpr_hda_pcm[i], dnpr_hda_pcm_dma[i]);

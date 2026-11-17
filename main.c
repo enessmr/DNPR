@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
@@ -12,11 +13,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <xf86drmMode.h>
+#ifndef DNPR_ASSET_BUILDER
+#include "panic_sim.h"
+#endif
 
 static int screen_w=1920,screen_h=1080;
 #define W screen_w
@@ -33,12 +38,12 @@ typedef struct { float x,y,z,invz,lr,lg,lb,nx,ny,nz; } Projected;
 
 static Mesh mesh;
 static uint32_t *pixels,*background,*final_head_cache;
-static struct {
+static struct drm_buffer {
     int fd;
     uint32_t handle,pitch;
     size_t size;
     void *map;
-} drm_buffer={.fd=-1};
+} drm_buffers[2]={{.fd=-1},{.fd=-1}};
 static float *depth;
 static pthread_t raster_workers[15];
 static pthread_mutex_t raster_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -68,6 +73,7 @@ static Vec3 star_positions[131][2];
 static int head_frame=-1,head_next=-1;
 static float head_frac=-1;
 static int selected_frame=-1;
+static int selected_time_ms=-1;
 
 static bool load_head(void){
     char path[4096];
@@ -162,7 +168,7 @@ static bool init_buffers(int width,int height){
  * either monitor's mode. Keep a RAM source image: reads from NVIDIA's mapped
  * video memory are far too slow for SDL's window-surface presentation.
  */
-static bool init_drm_buffer(void){
+static bool init_drm_buffer(struct drm_buffer *buffer,int height){
     glob_t cards={0};
     if(glob("/dev/dri/card[0-9]*",0,NULL,&cards)!=0)return false;
     for(size_t i=0;i<cards.gl_pathc;i++){
@@ -170,19 +176,19 @@ static bool init_drm_buffer(void){
         uint32_t handle=0,pitch=0;
         uint64_t size=0,offset=0;
         if(fd<0)continue;
-        if(drmModeCreateDumbBuffer(fd,W,H,32,0,&handle,&pitch,&size)!=0){close(fd);continue;}
-        if(pitch!=(uint32_t)W*4 || size<(uint64_t)pitch*H ||
+        if(drmModeCreateDumbBuffer(fd,W,height,32,0,&handle,&pitch,&size)!=0){close(fd);continue;}
+        if(pitch!=(uint32_t)W*4 || size<(uint64_t)pitch*height ||
            drmModeMapDumbBuffer(fd,handle,&offset)!=0){
             drmModeDestroyDumbBuffer(fd,handle);close(fd);continue;
         }
         void *map=mmap(NULL,(size_t)size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,(off_t)offset);
         if(map==MAP_FAILED){drmModeDestroyDumbBuffer(fd,handle);close(fd);continue;}
-        drm_buffer.fd=fd;
-        drm_buffer.handle=handle;
-        drm_buffer.pitch=pitch;
-        drm_buffer.size=(size_t)size;
-        drm_buffer.map=map;
-        fprintf(stderr,"DNPR: mapped DRM scanout copy on %s\n",cards.gl_pathv[i]);
+        buffer->fd=fd;
+        buffer->handle=handle;
+        buffer->pitch=pitch;
+        buffer->size=(size_t)size;
+        buffer->map=map;
+        fprintf(stderr,"DNPR: mapped DRM buffer on %s\n",cards.gl_pathv[i]);
         globfree(&cards);
         return true;
     }
@@ -190,14 +196,30 @@ static bool init_drm_buffer(void){
     return false;
 }
 
-static void release_drm_buffer(void){
-    if(!drm_buffer.map)return;
-    munmap(drm_buffer.map,drm_buffer.size);
-    drmModeDestroyDumbBuffer(drm_buffer.fd,drm_buffer.handle);
-    close(drm_buffer.fd);
-    drm_buffer.map=NULL;
-    drm_buffer.fd=-1;
+static void release_drm_buffer(struct drm_buffer *buffer){
+    if(!buffer->map)return;
+    munmap(buffer->map,buffer->size);
+    drmModeDestroyDumbBuffer(buffer->fd,buffer->handle);
+    close(buffer->fd);
+    buffer->map=NULL;
+    buffer->fd=-1;
 }
+#ifndef DNPR_ASSET_BUILDER
+static bool init_panic_scanouts(void){
+    for(unsigned int index=0;index<2;index++){
+        if(!init_drm_buffer(&drm_buffers[index],1152)||
+           drm_buffers[index].pitch!=(uint32_t)W*4||
+           drm_buffers[index].size<(size_t)W*4*1152){
+            for(unsigned int buffer=0;buffer<2;buffer++)release_drm_buffer(&drm_buffers[buffer]);
+            return false;
+        }
+    }
+    for(unsigned int index=0;index<2;index++)
+        if(!panic_sim_set_scanout(index,drm_buffers[index].map,
+                                  drm_buffers[index].size,drm_buffers[index].pitch))abort();
+    return true;
+}
+#endif
 
 static void pose_head(int frame,int next,float frac){
     if(next>130)next=130;
@@ -413,11 +435,11 @@ static void textured_sprite(const uint8_t *source,int source_size,int cx,int cy,
     textured_sprite_tinted(source,source_size,cx,cy,size,false);
 }
 
-static void star_with_particles(int image,int cx,int cy,int size,float seconds,bool red){
+static void star_with_particles(int image,int cx,int cy,int size,unsigned sprite_tick,bool red){
     int sparkle_size=H>=720?128:32;
     const uint8_t *sparkles=H>=720?sparkle_images_hd:sparkle_images;
     if(!red){
-        int sparkle_frame=(((int)floorf(seconds*12.f))+4)%6;
+        int sparkle_frame=(sprite_tick+4)%6;
         textured_sprite(sparkles+(size_t)sparkle_frame*sparkle_size*sparkle_size*4,sparkle_size,
             cx+size/2,cy-size/4,size*5/3);
         textured_sprite(sparkles+(size_t)((sparkle_frame+3)%6)*sparkle_size*sparkle_size*4,sparkle_size,
@@ -425,7 +447,7 @@ static void star_with_particles(int image,int cx,int cy,int size,float seconds,b
         textured_sprite(sparkles+(size_t)((sparkle_frame+1)%6)*sparkle_size*sparkle_size*4,sparkle_size,
             cx+size/2,cy-size,size/2);
     }else{
-        int sparkle_frame=(((int)floorf(seconds*12.f))+2)%6;
+        int sparkle_frame=(sprite_tick+2)%6;
         textured_sprite_tinted(sparkles+(size_t)sparkle_frame*sparkle_size*sparkle_size*4,sparkle_size,
             cx+size,cy-size/2,size*3/2,true);
         textured_sprite_tinted(sparkles+(size_t)((sparkle_frame+3)%6)*sparkle_size*sparkle_size*4,sparkle_size,
@@ -438,7 +460,9 @@ static void star_with_particles(int image,int cx,int cy,int size,float seconds,b
 
 static void frame(double seconds,bool static_frame,bool animation_only,bool overlays){
     static bool final_cached=false;
-    float pose=selected_frame>=0?(float)selected_frame:(static_frame?130.f:(float)seconds*30.f);
+    uint64_t elapsed_ms=seconds>0?(uint64_t)(seconds*1000.0):0;
+    uint64_t pose_q=elapsed_ms*30*65536/1000;
+    float pose=selected_frame>=0?(float)selected_frame:(static_frame?130.f:(float)pose_q/65536.f);
     if(pose>130.f)pose=130.f;
     int frame_index=(int)pose;
     float pose_frac=pose-(float)frame_index;
@@ -461,11 +485,13 @@ static void frame(double seconds,bool static_frame,bool animation_only,bool over
     // base frame renders the same pose without overlays; the kernel composites
     // these layers live from the preloaded sprites.
     if(overlays){
-        float star_time=selected_frame>=0?selected_frame/30.f:(static_frame?130.f/30.f:(float)seconds);
+        uint64_t overlay_ms=selected_frame>=0?(uint64_t)selected_frame*1000/30:
+            (static_frame?130ULL*1000/30:elapsed_ms);
+        unsigned sprite_tick=(unsigned)(overlay_ms*12/1000);
         int star_size=H/24;
-        star_with_particles(((int)floorf(star_time*30.f)+1)%8,W*21/100,H*97/100,star_size,star_time,false);
-        star_with_particles(8+((int)floorf(star_time*30.f)+5)%8,W*92/100,H*16/100,star_size/2,star_time,true);
-        if(static_frame||fmod(seconds,.85)<.58){
+        star_with_particles((sprite_tick+1)%8,W*21/100,H*97/100,star_size,sprite_tick,false);
+        star_with_particles(8+(sprite_tick+5)%8,W*92/100,H*16/100,star_size/2,sprite_tick,true);
+        if(static_frame||!((overlay_ms/500)&1)){
             draw_prompt();
         }
     }
@@ -530,10 +556,31 @@ static int save_ppm(const char *path){
     for(int i=0;i<W*H;i++){uint8_t c[]={pixels[i]>>16,pixels[i]>>8,pixels[i]};fwrite(c,1,3,f);}
     fclose(f);return 0;
 }
-static void usage(void){puts("dnpr-test [--no-audio] [--no-drm-buffer] [--static] [--animation] [--display N]\n"
-    "          [--stop] [--status] [--displays] [--render-frame FILE]\n"
-    "          [--render-base-frame FILE] [--frame N]\n"
-    "Escape exits. Preview uses a compositor-managed fullscreen window.");}
+#ifndef DNPR_ASSET_BUILDER
+static double monotonic_seconds(void){
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC,&now);
+    return now.tv_sec+now.tv_nsec/1000000000.0;
+}
+static bool parse_benchmark_number(const char *value,unsigned int *number){
+    char *end;
+    unsigned long parsed;
+
+    if(!value[0]||value[0]=='-')return false;
+    errno=0;
+    parsed=strtoul(value,&end,10);
+    if(errno||*end||parsed>UINT_MAX)return false;
+    *number=(unsigned int)parsed;
+    return true;
+}
+#endif
+static void usage(void){puts("dnpr-test [--no-audio] [--no-drm-buffer] [--static] [--animation] [--frame-step] [--display N]\n"
+    "          [--stop] [--status] [--displays] [--benchmark-panic [--from N] [--to N] [--total-frames N]]\n"
+    "          [--render-base-frame FILE] [--frame N] [--time-ms N] [--legacy-preview]\n"
+    "          [--panic-threads N] (1..16, default: online CPUs, capped at 16)\n"
+    "          [--unshaded | --no-specular] (simulation diagnostics only)\n"
+    "With --frame-step, F advances one 30 FPS video frame and its audio slice; Escape exits.\n"
+    "Preview uses a compositor-managed fullscreen window.");}
 
 static bool acer_display(int index){
     const char *name=SDL_GetDisplayName(index);
@@ -571,35 +618,202 @@ static bool acer_display(int index){
 }
 
 int main(int argc,char **argv){
-    bool with_audio=true,static_frame=false,animation_only=false,displays=false;
+    bool with_audio=true,static_frame=false,animation_only=false,displays=false,benchmark_panic=false;
+    bool frame_step=false;
+    bool benchmark_from_set=false,benchmark_to_set=false,benchmark_total_set=false;
+    unsigned int benchmark_from=0,benchmark_to=6,benchmark_total=7;
+    unsigned int panic_threads=0;
     bool drm_copy=true;
+#ifndef DNPR_ASSET_BUILDER
+    bool unshaded=false,no_specular=false;
+#endif
+#ifdef DNPR_ASSET_BUILDER
+    bool panic_mode=false;
+#else
+    bool panic_mode=true;
+#endif
     const char *render_path=NULL,*base_path=NULL;int display=-1;char command=0;
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--audio"))with_audio=true;
         else if(!strcmp(argv[i],"--no-audio"))with_audio=false;
         else if(!strcmp(argv[i],"--static"))static_frame=true;
         else if(!strcmp(argv[i],"--animation"))animation_only=true;
+        else if(!strcmp(argv[i],"--frame-step"))frame_step=true;
         else if(!strcmp(argv[i],"--displays"))displays=true;
+        else if(!strcmp(argv[i],"--benchmark-panic"))benchmark_panic=true;
+        else if(!strcmp(argv[i],"--panic-threads")&&i+1<argc){
+#ifndef DNPR_ASSET_BUILDER
+            if(!parse_benchmark_number(argv[++i],&panic_threads)||
+               panic_threads<1||panic_threads>16)return 2;
+#else
+            return 2;
+#endif
+        }
+        else if(!strcmp(argv[i],"--from")&&i+1<argc){
+#ifndef DNPR_ASSET_BUILDER
+            if(!parse_benchmark_number(argv[++i],&benchmark_from))return 2;
+            benchmark_from_set=true;
+#endif
+        }
+        else if(!strcmp(argv[i],"--to")&&i+1<argc){
+#ifndef DNPR_ASSET_BUILDER
+            if(!parse_benchmark_number(argv[++i],&benchmark_to))return 2;
+            benchmark_to_set=true;
+#endif
+        }
+        else if(!strcmp(argv[i],"--total-frames")&&i+1<argc){
+#ifndef DNPR_ASSET_BUILDER
+            if(!parse_benchmark_number(argv[++i],&benchmark_total))return 2;
+            benchmark_total_set=true;
+#endif
+        }
         else if(!strcmp(argv[i],"--no-drm-buffer"))drm_copy=false;
+        else if(!strcmp(argv[i],"--unshaded")){
+#ifndef DNPR_ASSET_BUILDER
+            unshaded=true;
+#else
+            return 2;
+#endif
+        }
+        else if(!strcmp(argv[i],"--no-specular")){
+#ifndef DNPR_ASSET_BUILDER
+            no_specular=true;
+#else
+            return 2;
+#endif
+        }
+        else if(!strcmp(argv[i],"--legacy-preview"))panic_mode=false;
         else if(!strcmp(argv[i],"--status"))command='s';
         else if(!strcmp(argv[i],"--stop"))command='q';
         else if(!strcmp(argv[i],"--display")&&i+1<argc)display=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--render-frame")&&i+1<argc)render_path=argv[++i];
         else if(!strcmp(argv[i],"--render-base-frame")&&i+1<argc)base_path=argv[++i];
         else if(!strcmp(argv[i],"--frame")&&i+1<argc)selected_frame=atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--time-ms")&&i+1<argc)selected_time_ms=atoi(argv[++i]);
         else if(!strcmp(argv[i],"--help")){usage();return 0;}
         else {usage();return 2;}
     }
     if(selected_frame>130||selected_frame< -1){fputs("Frame must be 0..130\n",stderr);return 2;}
+    if(selected_time_ms< -1|| (selected_time_ms>=0&&selected_frame>=0)){
+        fputs("Time must be nonnegative and cannot be combined with --frame\n",stderr);return 2;
+    }
+    if(selected_time_ms>=0&&!render_path&&!base_path){
+        fputs("--time-ms requires --render-frame or --render-base-frame\n",stderr);return 2;
+    }
+    if(frame_step&&(benchmark_panic||render_path||base_path||static_frame||selected_frame>=0||selected_time_ms>=0)){
+        fputs("--frame-step requires an animated fullscreen preview\n",stderr);return 2;
+    }
+#ifndef DNPR_ASSET_BUILDER
+    if(unshaded&&no_specular){fputs("Choose only one shading diagnostic\n",stderr);return 2;}
+    if((unshaded||no_specular)&&!panic_mode){fputs("Shading diagnostics require the panic renderer\n",stderr);return 2;}
+#endif
+    if(benchmark_from_set||benchmark_to_set||benchmark_total_set){
+        if(!benchmark_panic){fputs("--from, --to, and --total-frames require --benchmark-panic\n",stderr);return 2;}
+        if(!benchmark_total_set&&benchmark_from_set&&benchmark_to_set){
+            if(benchmark_to<benchmark_from){fputs("--to must be at least --from\n",stderr);return 2;}
+            benchmark_total=benchmark_to-benchmark_from+1;
+        }else if(benchmark_to_set&&!benchmark_from_set){
+            if(!benchmark_total||benchmark_total>benchmark_to+1ULL){
+                fputs("Benchmark range starts before frame zero\n",stderr);return 2;
+            }
+            benchmark_from=benchmark_to-benchmark_total+1;
+        }else if(!benchmark_to_set){
+            if(!benchmark_total||benchmark_from+(uint64_t)benchmark_total-1>UINT_MAX){
+                fputs("Invalid benchmark range\n",stderr);return 2;
+            }
+            benchmark_to=benchmark_from+benchmark_total-1;
+        }
+        if(!benchmark_total||benchmark_to<benchmark_from||
+           benchmark_to-(uint64_t)benchmark_from+1!=benchmark_total||
+           (uint64_t)benchmark_to*1000/30>UINT_MAX){
+            fputs("Inconsistent benchmark range\n",stderr);return 2;
+        }
+    }
     const char *runtime=getenv("XDG_RUNTIME_DIR");if(!runtime)runtime="/tmp";
     if(snprintf(socket_path,sizeof(socket_path),"%s/dnpr-test-%u.sock",runtime,(unsigned)getuid())>=(int)sizeof(socket_path)){
         fputs("Runtime path is too long\n",stderr);return 1;
     }
     if(command){if(control(&command)<0){puts("not running");return command=='s'?0:1;}return 0;}
+    if(panic_threads){
+#ifndef DNPR_ASSET_BUILDER
+        if(!panic_mode){fputs("--panic-threads requires the panic renderer\n",stderr);return 2;}
+        panic_sim_set_threads(panic_threads);
+#endif
+    }
+    if(benchmark_panic){
+#ifndef DNPR_ASSET_BUILDER
+        W=1920;H=1080;
+        pixels=malloc((size_t)W*H*sizeof(*pixels));
+        if(!pixels||!panic_sim_init())return 1;
+        printf("panic raster threads: %u\n",panic_sim_thread_count());
+        panic_sim_set_unshaded(unshaded);
+        panic_sim_set_no_specular(no_specular);
+        if(drm_copy&&!init_panic_scanouts())
+            fputs("DNPR: mapped scanouts unavailable; benchmarking RAM fallback\n",stderr);
+        if(benchmark_from)
+            panic_sim_render((unsigned int)((uint64_t)(benchmark_from-1)*1000/30),
+                             benchmark_from-1,pixels);
+        double total=0;
+        double animated_total=0,settled_total=0;
+        unsigned int animated_count=0,settled_count=0;
+        struct panic_sim_timing stages={0};
+        for(unsigned int index=benchmark_from;;index++){
+            struct panic_sim_timing timing;
+            double begin=monotonic_seconds();
+            panic_sim_render_timed((unsigned int)((uint64_t)index*1000/30), index,
+                                   pixels,&timing);
+            double elapsed=monotonic_seconds()-begin;
+            total+=elapsed;
+            if(timing.head_changed){animated_total+=elapsed;animated_count++;}
+            else {settled_total+=elapsed;settled_count++;}
+            stages.prepare_ms+=timing.prepare_ms;stages.raster_ms+=timing.raster_ms;
+            stages.compose_ms+=timing.compose_ms;stages.blit_ms+=timing.blit_ms;
+            stages.copy_ms+=timing.copy_ms;
+            printf("frame %u: %.2f ms (raster %.2f, compose %.2f, blit %.2f)\n",
+                   index,elapsed*1000,timing.raster_ms,timing.compose_ms,timing.blit_ms);
+            if(index==benchmark_to)break;
+        }
+        printf("%u frames (%u..%u): %.2f ms average, %.2f fps render throughput\n",
+               benchmark_total,benchmark_from,benchmark_to,
+               total*1000/benchmark_total,benchmark_total/total);
+        if(animated_count)
+            printf("animated: %u frames, %.2f ms average, %.2f fps render throughput\n",
+                   animated_count,animated_total*1000/animated_count,
+                   animated_count/animated_total);
+        if(settled_count)
+            printf("settled: %u frames, %.2f ms average, %.2f fps render throughput\n",
+                   settled_count,settled_total*1000/settled_count,
+                   settled_count/settled_total);
+        printf("average stages: prepare %.2f, raster %.2f, compose %.2f, blit %.2f, preview copy %.2f ms\n",
+               stages.prepare_ms/benchmark_total,stages.raster_ms/benchmark_total,
+               stages.compose_ms/benchmark_total,stages.blit_ms/benchmark_total,
+               stages.copy_ms/benchmark_total);
+        panic_sim_destroy();
+        for(unsigned int index=0;index<2;index++)release_drm_buffer(&drm_buffers[index]);
+        free(pixels);
+        return 0;
+#endif
+    }
     if(render_path||base_path){
+        if(render_path&&panic_mode){
+#ifndef DNPR_ASSET_BUILDER
+            W=1920;H=1080;
+            pixels=malloc((size_t)W*H*sizeof(*pixels));
+            if(!pixels||!panic_sim_init())return 1;
+            panic_sim_set_unshaded(unshaded);
+            panic_sim_set_no_specular(no_specular);
+            unsigned int elapsed_ms=selected_time_ms>=0?(unsigned int)selected_time_ms:
+                selected_frame>=0?(unsigned int)selected_frame*1000/30:130U*1000/30;
+            panic_sim_render(elapsed_ms,0,pixels);
+            int result=save_ppm(render_path);
+            panic_sim_destroy();free(pixels);
+            return result;
+#endif
+        }
         if(!load_head()||!load_scene()||!init_buffers(1920,1080))return 1;
         raster_init();
-        frame(130.f/30.f,true,false,render_path!=NULL);
+        frame(selected_time_ms>=0?selected_time_ms/1000.0:130.f/30.f,
+            selected_time_ms<0,false,render_path!=NULL);
         raster_shutdown();
         return save_ppm(render_path?render_path:base_path);
     }
@@ -616,14 +830,29 @@ int main(int argc,char **argv){
     if(display>=count){fputs("Invalid display index\n",stderr);SDL_Quit();return 2;}
     if(!acer_display(display)){fputs("Selected display is not identified as Acer; refusing fullscreen preview\n",stderr);SDL_Quit();return 2;}
     SDL_Rect bounds;SDL_GetDisplayBounds(display,&bounds);
-    if(!load_head()||!load_scene()||!init_buffers(bounds.w,bounds.h)||
-        (with_audio&&!load_audio())){SDL_Quit();return 1;}
+    if(panic_mode){
+#ifndef DNPR_ASSET_BUILDER
+        if(bounds.w!=1920||bounds.h!=1080){
+            fputs("Panic renderer requires a 1920x1080 display\n",stderr);SDL_Quit();return 1;
+        }
+        W=bounds.w;H=bounds.h;
+        pixels=malloc((size_t)W*H*sizeof(*pixels));
+        if(!pixels||!panic_sim_init()||(with_audio&&!load_audio())){
+            panic_sim_destroy();free(pixels);SDL_Quit();return 1;
+        }
+        panic_sim_set_unshaded(unshaded);
+        panic_sim_set_no_specular(no_specular);
+        if(drm_copy&&!init_panic_scanouts())
+            fputs("DNPR: mapped scanouts unavailable; using RAM fallback\n",stderr);
+#endif
+    }else if(!load_head()||!load_scene()||!init_buffers(bounds.w,bounds.h)||
+             (with_audio&&!load_audio())){SDL_Quit();return 1;}
     if(!create_server()){fputs("Preview already running or control socket unavailable\n",stderr);SDL_Quit();return 1;}
     SDL_Window *win=SDL_CreateWindow("DNPR preview",SDL_WINDOWPOS_CENTERED_DISPLAY(display),
         SDL_WINDOWPOS_CENTERED_DISPLAY(display),bounds.w,bounds.h,
         SDL_WINDOW_BORDERLESS|SDL_WINDOW_FULLSCREEN_DESKTOP|SDL_WINDOW_ALLOW_HIGHDPI);
     if(!win){fprintf(stderr,"Window: %s\n",SDL_GetError());goto fail;}
-    if(drm_copy&&!init_drm_buffer())
+    if(!panic_mode&&drm_copy&&!init_drm_buffer(&drm_buffers[0],H))
         fputs("DNPR: mapped DRM buffer unavailable; using the RAM image\n",stderr);
     SDL_Surface *window_surface=SDL_GetWindowSurface(win);
     SDL_Surface *image=SDL_CreateRGBSurfaceFrom(pixels,W,H,32,W*4,
@@ -631,47 +860,103 @@ int main(int argc,char **argv){
     if(!window_surface||!image){
         fprintf(stderr,"Window surface: %s\n",SDL_GetError());
         if(image)SDL_FreeSurface(image);
-        release_drm_buffer();SDL_DestroyWindow(win);goto fail;
+        for(unsigned int index=0;index<2;index++)release_drm_buffer(&drm_buffers[index]);
+        SDL_DestroyWindow(win);goto fail;
     }
-    raster_init();
+    if(!panic_mode)raster_init();
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"0");
     uint32_t audio_pos=0;SDL_AudioDeviceID audio=0;
     if(with_audio){SDL_AudioSpec want={0};want.freq=32000;want.format=AUDIO_S16SYS;
-        want.channels=2;want.samples=1024;want.callback=audio_callback;want.userdata=&audio_pos;
+        want.channels=2;want.samples=1024;
+        if(!frame_step){want.callback=audio_callback;want.userdata=&audio_pos;}
         audio=SDL_OpenAudioDevice(NULL,0,&want,NULL,0);
         if(audio)SDL_PauseAudioDevice(audio,0);else fprintf(stderr,"Audio: %s\n",SDL_GetError());
     }
     signal(SIGINT,on_signal);signal(SIGTERM,on_signal);
     uint64_t start=SDL_GetPerformanceCounter();double freq=(double)SDL_GetPerformanceFrequency();
+    uint64_t next_frame=start+(uint64_t)(freq*6944444.0/1000000000.0);
     unsigned debug_frame=0;
+    unsigned step_frame=0,step_pending=0;
+    bool first_step_frame=true;
     while(running){
         SDL_Event event;while(SDL_PollEvent(&event)){
             if(event.type==SDL_QUIT||(event.type==SDL_KEYDOWN&&event.key.keysym.sym==SDLK_ESCAPE))running=0;
+            if(frame_step&&event.type==SDL_KEYDOWN&&event.key.keysym.sym==SDLK_f&&
+               !event.key.repeat&&step_frame+step_pending<UINT_MAX)
+                step_pending++;
             if(event.type==SDL_DISPLAYEVENT&&event.display.event==SDL_DISPLAYEVENT_DISCONNECTED)running=0;
         }
         poll_control();
-        double sec=(SDL_GetPerformanceCounter()-start)/freq;
-        frame(sec,static_frame,animation_only,true);
-        /* Same top-left magenta frame counter as the panic compositor. */
-        unsigned bar_w=((++debug_frame%40)+1)*8;
-        if(bar_w>(unsigned)W)bar_w=(unsigned)W;
-        for(unsigned y=0;y<4&&y<(unsigned)H;y++)
-            for(unsigned x=0;x<bar_w;x++)pixels[(size_t)y*W+x]=rgb(255,0,255);
-        if(drm_buffer.map)
-            memcpy(drm_buffer.map,pixels,(size_t)W*H*sizeof(*pixels));
+        if(!running)break;
+        if(frame_step&&!first_step_frame&&!step_pending){SDL_Delay(10);continue;}
+        if(frame_step){
+            if(first_step_frame){
+                first_step_frame=false;
+                puts("frame 0 (paused; press F to advance)");
+            }
+            else{
+                step_frame++;
+                step_pending--;
+                if(audio){
+                    uint64_t begin=(uint64_t)step_frame*32000/30;
+                    uint64_t end=(uint64_t)(step_frame+1)*32000/30;
+                    SDL_ClearQueuedAudio(audio);
+                    if(begin<audio_values/2){
+                        if(end>audio_values/2)end=audio_values/2;
+                        if(SDL_QueueAudio(audio,audio_samples+begin*2,
+                                          (Uint32)((end-begin)*2*sizeof(*audio_samples)))<0)
+                            fprintf(stderr,"Audio queue: %s\n",SDL_GetError());
+                    }
+                }
+                printf("frame %u\n",step_frame);
+                fflush(stdout);
+            }
+        }
+        uint64_t now=SDL_GetPerformanceCounter();
+        if(panic_mode&&!frame_step&&now<next_frame){
+            Uint32 delay=(Uint32)((next_frame-now)*1000/freq);
+            if(delay)SDL_Delay(delay);
+            while((now=SDL_GetPerformanceCounter())<next_frame){}
+        }
+        now=SDL_GetPerformanceCounter();
+        double sec=frame_step?step_frame/30.0:(now-start)/freq;
+        if(panic_mode&&!frame_step){
+            next_frame=now+(uint64_t)(freq*6944444.0/1000000000.0);
+        }
+        if(panic_mode){
+#ifndef DNPR_ASSET_BUILDER
+            panic_sim_render(static_frame?130U*1000/30:
+                             frame_step?(unsigned int)((uint64_t)step_frame*1000/30):(unsigned int)(sec*1000),
+                             ++debug_frame,pixels);
+#endif
+        }else{
+            frame(sec,static_frame,animation_only,true);
+            unsigned bar_w=((++debug_frame%40)+1)*8;
+            if(bar_w>(unsigned)W)bar_w=(unsigned)W;
+            for(unsigned y=0;y<4&&y<(unsigned)H;y++)
+                for(unsigned x=0;x<bar_w;x++)pixels[(size_t)y*W+x]=rgb(255,0,255);
+        }
+        if(!panic_mode&&drm_buffers[0].map)
+            memcpy(drm_buffers[0].map,pixels,(size_t)W*H*sizeof(*pixels));
         /* Fullscreen settling can invalidate SDL's window surface. */
         window_surface=SDL_GetWindowSurface(win);
         if(!window_surface||SDL_BlitScaled(image,NULL,window_surface,NULL)!=0||
            SDL_UpdateWindowSurface(win)!=0){
             fprintf(stderr,"Window present: %s\n",SDL_GetError());break;
         }
-        SDL_Delay(1);
+        if(!panic_mode&&!frame_step)SDL_Delay(1);
     }
     if(audio)SDL_CloseAudioDevice(audio);
-    raster_shutdown();
-    SDL_FreeSurface(image);release_drm_buffer();SDL_DestroyWindow(win);
+    if(!panic_mode)raster_shutdown();
+    SDL_FreeSurface(image);SDL_DestroyWindow(win);
 fail:
     close(server_fd);unlink(socket_path);SDL_Quit();
+    if(panic_mode){
+#ifndef DNPR_ASSET_BUILDER
+        panic_sim_destroy();
+#endif
+    }
+    for(unsigned int index=0;index<2;index++)release_drm_buffer(&drm_buffers[index]);
     free(pixels);free(background);free(final_head_cache);free(depth);
     free(background_rows);free(star_images);free(prompt_images);free(prompt_images_hd);
     free(sparkle_images);free(sparkle_images_hd);free(audio_samples);

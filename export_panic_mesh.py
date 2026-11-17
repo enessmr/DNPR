@@ -77,11 +77,16 @@ for xyz, stars in frames:
     shade = np.column_stack((base + warm * .16,
                              base + warm * .015,
                              base + warm * .015))
-    xyz_q = np.clip(np.rint(xyz * 256), -32768, 32767).astype(np.int16)
+    xyz_q = np.rint(xyz * 256).astype(np.int64)
+    if np.any(xyz_q[:, :2] < -32768) or np.any(xyz_q[:, :2] > 32767):
+        raise SystemExit('posed X/Y exceeds the signed 16-bit Q8 mesh format')
+    cam_z = 20 * 256 - xyz_q[:, 2]
+    if np.any(cam_z < 1) or np.any(cam_z > 65535):
+        raise SystemExit('posed camera Z exceeds the unsigned 16-bit depth format')
     shade_q = np.clip(np.rint(shade * 256), 0, 65535).astype(np.uint16)
     normal_q = np.clip(np.rint(normal * 127), -128, 127).astype(np.int8)
     for i in range(nv):
-        payload += struct.pack('<hhhHHHbbbB', *xyz_q[i], *shade_q[i], *normal_q[i], 0)
+        payload += struct.pack('<hhiHHHbbbB', *xyz_q[i], *shade_q[i], *normal_q[i], 0)
 
 compressor = zlib.compressobj(level=9, wbits=-15)
 blob = compressor.compress(payload) + compressor.flush()
