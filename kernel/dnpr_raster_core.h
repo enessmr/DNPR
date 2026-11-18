@@ -90,23 +90,40 @@ static const struct dnpr_live_triangle *dnpr_tris(void);
 #define DNPR_NO_SPECULAR false
 #endif
 
-static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
-				    const struct dnpr_projected *b,
-				    const struct dnpr_projected *c,
-				    const struct dnpr_live_triangle *tri,
-				    int band_y0, int band_y1)
+/* Projection changes once per frame, but tall triangles are visited by
+ * several row bands. Cache the expensive triangle setup once for that frame.
+ */
+struct dnpr_triangle_setup {
+	s64 area, slope_ab, slope_bc, slope_ca;
+	s64 step0, step1, dz, dr, dg, db, dnx, dny, dnz;
+	u64 reciprocal;
+	int x0, x1, y0, y1;
+	unsigned int nearest_z;
+	int sign;
+	bool unshaded, no_specular, valid;
+};
+
+static struct dnpr_triangle_setup dnpr_triangle_setup[DNPR_LIVE_NT];
+
+static void dnpr_prepare_triangle_setup(unsigned int index)
 {
+	const struct dnpr_live_triangle *tri = &dnpr_tris()[index];
+	const struct dnpr_projected *a = &dnpr_projected[tri->a];
+	const struct dnpr_projected *b = &dnpr_projected[tri->b];
+	const struct dnpr_projected *c = &dnpr_projected[tri->c];
+	struct dnpr_triangle_setup *setup = &dnpr_triangle_setup[index];
 	s64 area = dnpr_edge(a->x, a->y, b->x, b->y, c->x, c->y);
 	s64 slope_ab = 0, slope_bc = 0, slope_ca = 0;
 	s64 step0, step1, dz, dr, dg, db, dnx, dny, dnz;
 	u64 reciprocal = 0, remainder;
-	int x0, x1, y0, y1, x, y, sign;
+	int x0, x1, y0, y1, sign;
 	bool unshaded = DNPR_UNSHADED;
 	unsigned int nearest_z = min3(a->z, b->z, c->z);
 	bool no_specular = max3(-59 * a->nx + 41 * a->ny + 106 * a->nz,
 				-59 * b->nx + 41 * b->ny + 106 * b->nz,
 				-59 * c->nx + 41 * c->ny + 106 * c->nz) <= -207;
 
+	setup->valid = false;
 	if (!area)
 		return;
 	sign = area < 0 ? -1 : 1;
@@ -123,12 +140,6 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 	}
 	y0 = clamp_t(int, min3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
 	y1 = clamp_t(int, max3(a->y, b->y, c->y), 0, DNPR_HEIGHT - 1);
-	if (y0 < band_y0)
-		y0 = band_y0;
-	if (y1 > band_y1)
-		y1 = band_y1;
-	if (y0 > y1)
-		return; /* The band misses every row of this triangle. */
 	x0 = clamp_t(int, min3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
 	x1 = clamp_t(int, max3(a->x, b->x, c->x), 0, DNPR_WIDTH - 1);
 	if (a->y != b->y)
@@ -166,6 +177,46 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 			step0 * ((s64)a->nz - c->nz) +
 			step1 * ((s64)b->nz - c->nz), area, reciprocal);
 	}
+	*setup = (struct dnpr_triangle_setup){
+		.area = area,
+		.slope_ab = slope_ab, .slope_bc = slope_bc,
+		.slope_ca = slope_ca,
+		.step0 = step0, .step1 = step1,
+		.dz = dz, .dr = dr, .dg = dg, .db = db,
+		.dnx = dnx, .dny = dny, .dnz = dnz,
+		.reciprocal = reciprocal,
+		.x0 = x0, .x1 = x1, .y0 = y0, .y1 = y1,
+		.nearest_z = nearest_z, .sign = sign,
+		.unshaded = unshaded, .no_specular = no_specular,
+		.valid = true,
+	};
+}
+
+static void dnpr_draw_live_triangle(unsigned int index,
+				    int band_y0, int band_y1)
+{
+	const struct dnpr_live_triangle *tri = &dnpr_tris()[index];
+	const struct dnpr_projected *a = &dnpr_projected[tri->a];
+	const struct dnpr_projected *b = &dnpr_projected[tri->b];
+	const struct dnpr_projected *c = &dnpr_projected[tri->c];
+	const struct dnpr_triangle_setup *setup = &dnpr_triangle_setup[index];
+	s64 area = setup->area;
+	s64 slope_ab = setup->slope_ab, slope_bc = setup->slope_bc;
+	s64 slope_ca = setup->slope_ca;
+	s64 step0 = setup->step0, step1 = setup->step1;
+	s64 dz = setup->dz, dr = setup->dr, dg = setup->dg, db = setup->db;
+	s64 dnx = setup->dnx, dny = setup->dny, dnz = setup->dnz;
+	u64 reciprocal = setup->reciprocal;
+	int x0 = setup->x0, x1 = setup->x1;
+	int y0 = max(setup->y0, band_y0);
+	int y1 = min(setup->y1, band_y1);
+	int x, y, sign = setup->sign;
+	bool unshaded = setup->unshaded;
+	unsigned int nearest_z = setup->nearest_z;
+	bool no_specular = setup->no_specular;
+
+	if (!setup->valid || y0 > y1)
+		return;
 	for (y = y0; y <= y1; y++) {
 		s64 left = 0, right = 0, w0, w1;
 		s64 wz, wr, wg, wb, wnx, wny, wnz;
@@ -396,8 +447,22 @@ static bool dnpr_render_live_head_prepare(unsigned int elapsed_ms)
 		unsigned int index = dnpr_triangle_order[i];
 		int first, last, band;
 
+		dnpr_triangle_setup[index].valid = false;
 		if (t[index].a >= DNPR_LIVE_NV || t[index].b >= DNPR_LIVE_NV ||
 		    t[index].c >= DNPR_LIVE_NV)
+			continue;
+		/* Godot's face indices are reversed in the exported mesh. For this
+		 * camera and edge convention, negative area faces the camera. Cull
+		 * back faces before they enter any worker's band list. */
+		if (dnpr_edge(dnpr_projected[t[index].a].x,
+			      dnpr_projected[t[index].a].y,
+			      dnpr_projected[t[index].b].x,
+			      dnpr_projected[t[index].b].y,
+			      dnpr_projected[t[index].c].x,
+			      dnpr_projected[t[index].c].y) >= 0)
+			continue;
+		dnpr_prepare_triangle_setup(index);
+		if (!dnpr_triangle_setup[index].valid)
 			continue;
 		first = clamp_t(int, min3(dnpr_projected[t[index].a].y,
 					 dnpr_projected[t[index].b].y,

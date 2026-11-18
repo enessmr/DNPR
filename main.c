@@ -769,8 +769,11 @@ int main(int argc,char **argv){
             stages.prepare_ms+=timing.prepare_ms;stages.raster_ms+=timing.raster_ms;
             stages.compose_ms+=timing.compose_ms;stages.blit_ms+=timing.blit_ms;
             stages.copy_ms+=timing.copy_ms;
-            printf("frame %u: %.2f ms (raster %.2f, compose %.2f, blit %.2f)\n",
-                   index,elapsed*1000,timing.raster_ms,timing.compose_ms,timing.blit_ms);
+            stages.blit_bytes+=timing.blit_bytes;stages.blit_calls+=timing.blit_calls;
+            printf("frame %u: %.2f ms (raster %.2f, compose %.2f, blit %.2f; %llu bytes, %llu writes)\n",
+                   index,elapsed*1000,timing.raster_ms,timing.compose_ms,timing.blit_ms,
+                   (unsigned long long)timing.blit_bytes,
+                   (unsigned long long)timing.blit_calls);
             if(index==benchmark_to)break;
         }
         printf("%u frames (%u..%u): %.2f ms average, %.2f fps render throughput\n",
@@ -788,6 +791,9 @@ int main(int argc,char **argv){
                stages.prepare_ms/benchmark_total,stages.raster_ms/benchmark_total,
                stages.compose_ms/benchmark_total,stages.blit_ms/benchmark_total,
                stages.copy_ms/benchmark_total);
+        printf("average blit: %.2f MiB across %.0f writes per frame\n",
+               (double)stages.blit_bytes/benchmark_total/(1024.0*1024.0),
+               (double)stages.blit_calls/benchmark_total);
         panic_sim_destroy();
         for(unsigned int index=0;index<2;index++)release_drm_buffer(&drm_buffers[index]);
         free(pixels);
@@ -825,10 +831,11 @@ int main(int argc,char **argv){
         printf("%d: %s %dx%d @ %d Hz %s\n",i,SDL_GetDisplayName(i),r.w,r.h,mode.refresh_rate,acer_display(i)?"(Acer target)":"");
     }SDL_Quit();return 0;}
     if(count<1){fputs("No display available\n",stderr);SDL_Quit();return 1;}
-    if(display<0){for(int i=0;i<count;i++)if(acer_display(i)){display=i;break;}}
-    if(display<0){fputs("Acer display not identified; refusing fullscreen preview\n",stderr);SDL_Quit();return 1;}
+    if(display<0){
+        for(int i=0;i<count;i++)if(acer_display(i)){display=i;break;}
+        if(display<0)display=0;
+    }
     if(display>=count){fputs("Invalid display index\n",stderr);SDL_Quit();return 2;}
-    if(!acer_display(display)){fputs("Selected display is not identified as Acer; refusing fullscreen preview\n",stderr);SDL_Quit();return 2;}
     SDL_Rect bounds;SDL_GetDisplayBounds(display,&bounds);
     if(panic_mode){
 #ifndef DNPR_ASSET_BUILDER

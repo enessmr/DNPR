@@ -1,6 +1,5 @@
 static void dnpr_raster_rows(int y0, int y1)
 {
-	const struct dnpr_live_triangle *t = dnpr_tris();
 	unsigned int band;
 
 	for (band = y0 / DNPR_BAND_H; band <= y1 / DNPR_BAND_H; band++) {
@@ -11,10 +10,7 @@ static void dnpr_raster_rows(int y0, int y1)
 		for (i = 0; i < dnpr_band_triangle_count[band]; i++) {
 			unsigned int index = dnpr_band_triangles[band][i];
 
-			dnpr_draw_live_triangle(&dnpr_projected[t[index].a],
-						&dnpr_projected[t[index].b],
-						&dnpr_projected[t[index].c], &t[index],
-						band_y0, band_y1);
+			dnpr_draw_live_triangle(index, band_y0, band_y1);
 		}
 	}
 }

@@ -779,6 +779,7 @@ int __init dnpr_panic_init(void)
 	if (zlib_inflate_blob(dnpr_base, DNPR_SCENE_BYTES, dnpr_frame_deflate,
 			      sizeof(dnpr_frame_deflate)) != DNPR_SCENE_BYTES)
 		goto fail;
+	dnpr_prepare_rgb565_lut();
 	dnpr_layers = (u8 *)dnpr_base + DNPR_BASE_BYTES;
 	dnpr_live_data = vmalloc(DNPR_LIVE_BYTES);
 	dnpr_live_depth = vmalloc(DNPR_BASE_BYTES);

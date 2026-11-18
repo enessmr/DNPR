@@ -33,6 +33,9 @@ typedef int64_t s64;
 #define div_s64(value, divisor) ((value) / (divisor))
 #define div64_u64(value, divisor) ((value) / (divisor))
 
+/* DRM_FORMAT_XRGB8888 ('XR24'); the simulator's color conversion is identity. */
+#define DRM_FORMAT_XRGB8888 0x34325258U
+
 static u64 div64_u64_rem(u64 value, u64 divisor, u64 *remainder)
 {
 	*remainder = value % divisor;
@@ -153,6 +156,12 @@ static struct dnpr_sprite dnpr_shared_prev_sprites[DNPR_MAX_SPRITES];
 static unsigned int dnpr_shared_prev_sprite_count;
 static unsigned int dnpr_shared_prev_bar_w;
 static bool dnpr_shared_prev_valid;
+static u64 sim_blit_bytes;
+static u64 sim_blit_calls;
+#define DNPR_BLIT_ACCOUNT(bytes, calls) do { \
+	sim_blit_bytes += (bytes); \
+	sim_blit_calls += (calls); \
+} while (0)
 static u8 *dnpr_live_data;
 static u16 *dnpr_live_depth;
 static u16 *dnpr_live_owner;
@@ -189,7 +198,10 @@ void panic_sim_set_no_specular(bool enabled)
 	dnpr_no_specular = enabled;
 }
 
-static struct dnpr_format sim_format = { .cpp = { 4 } };
+static struct dnpr_format sim_format = {
+	.format = DRM_FORMAT_XRGB8888,
+	.cpp = { 4 },
+};
 static struct drm_scanout_buffer sim_scanouts[2];
 static bool sim_scanout_owned[2];
 
@@ -284,6 +296,28 @@ static void sim_set_pixel(struct drm_scanout_buffer *scanout,
 	memcpy(scanout->map[0].vaddr + offset, &color, sizeof(color));
 }
 
+static void sim_set_pixels(struct drm_scanout_buffer *scanout,
+			   unsigned int x, unsigned int y, const u32 *colors,
+			   unsigned int count)
+{
+	u32 columns = DIV_ROUND_UP(scanout->pitch[0], 64U);
+
+	while (count) {
+		u32 block_x = (x * 4) / 64;
+		u32 block_y = y / 128;
+		u32 block_offset = (block_y * columns + block_x) * (64 * 128);
+		u32 in_block_x = x % 16;
+		u32 offset = block_offset + in_block_x * 4 + (y % 128) * 64;
+		u32 span = min_t(u32, count, 16U - in_block_x);
+
+		memcpy(scanout->map[0].vaddr + offset, colors,
+		       span * sizeof(*colors));
+		x += span;
+		colors += span;
+		count -= span;
+	}
+}
+
 static bool inflate_blob(void *destination, size_t size,
 			 const u8 *source, size_t source_size)
 {
@@ -334,11 +368,15 @@ void panic_sim_destroy(void)
 	dnpr_base = NULL;
 	dnpr_shared_valid = false;
 	dnpr_last_pose_q = U64_MAX;
+	sim_blit_bytes = 0;
+	sim_blit_calls = 0;
 }
 
 bool panic_sim_init(void)
 {
 	size_t scanout_size = (size_t)DNPR_WIDTH * 4 * 1152;
+	sim_blit_bytes = 0;
+	sim_blit_calls = 0;
 
 	if (dnpr_frame_meta.base_w != DNPR_WIDTH ||
 	    dnpr_frame_meta.base_h != DNPR_HEIGHT)
@@ -358,6 +396,7 @@ bool panic_sim_init(void)
 			.pitch = { DNPR_WIDTH * 4 },
 			.format = &sim_format,
 			.set_pixel = sim_set_pixel,
+			.set_pixels = sim_set_pixels,
 		};
 		sim_scanouts[index].map[0].vaddr = malloc(scanout_size);
 		sim_scanout_owned[index] = true;
@@ -376,6 +415,7 @@ bool panic_sim_init(void)
 		panic_sim_destroy();
 		return false;
 	}
+	dnpr_prepare_rgb565_lut();
 	dnpr_layers = (u8 *)dnpr_base + DNPR_BASE_BYTES;
 	long cpus = sysconf(_SC_NPROCESSORS_ONLN);
 	unsigned int threads = sim_requested_threads ? sim_requested_threads :
@@ -431,6 +471,8 @@ void panic_sim_render_timed(unsigned int elapsed_ms, unsigned int frame,
 	double after_raster = timing ? sim_now_ms() : 0;
 	dnpr_render_shared(elapsed_ms, frame, initial, head_changed);
 	double after_compose = timing ? sim_now_ms() : 0;
+	u64 blit_bytes_before = sim_blit_bytes;
+	u64 blit_calls_before = sim_blit_calls;
 	for (unsigned int index = 0; index < 2; index++)
 		dnpr_blit_shared(&sim_scanouts[index], initial, head_changed);
 	double after_blit = timing ? sim_now_ms() : 0;
@@ -444,6 +486,8 @@ void panic_sim_render_timed(unsigned int elapsed_ms, unsigned int frame,
 			.compose_ms = after_compose - after_raster,
 			.blit_ms = after_blit - after_compose,
 			.copy_ms = sim_now_ms() - after_blit,
+			.blit_bytes = sim_blit_bytes - blit_bytes_before,
+			.blit_calls = sim_blit_calls - blit_calls_before,
 		};
 	}
 }

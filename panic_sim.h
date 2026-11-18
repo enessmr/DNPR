@@ -18,6 +18,8 @@ struct panic_sim_timing {
 	double compose_ms;
 	double blit_ms;
 	double copy_ms;
+	uint64_t blit_bytes;
+	uint64_t blit_calls;
 };
 void panic_sim_render(unsigned int elapsed_ms, unsigned int frame, uint32_t *pixels);
 void panic_sim_render_timed(unsigned int elapsed_ms, unsigned int frame,

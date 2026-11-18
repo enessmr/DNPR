@@ -1,3 +1,7 @@
+#ifndef DNPR_BLIT_ACCOUNT
+#define DNPR_BLIT_ACCOUNT(bytes, calls) do { } while (0)
+#endif
+
 static void dnpr_blit_shared(struct drm_scanout_buffer *sb, bool initial,
 			     bool head_changed)
 {
@@ -6,6 +10,7 @@ static void dnpr_blit_shared(struct drm_scanout_buffer *sb, bool initial,
 			  u32) = sb->set_pixel;
 	void (*set_pixels)(struct drm_scanout_buffer *, unsigned int, unsigned int,
 			   const u32 *, unsigned int) = sb->set_pixels;
+	bool native_xrgb8888 = sb->format->format == DRM_FORMAT_XRGB8888;
 
 	(void)initial;
 	(void)head_changed;
@@ -31,18 +36,38 @@ static void dnpr_blit_shared(struct drm_scanout_buffer *sb, bool initial,
 							break;
 						x++;
 					}
-					for (j = run; j < x; j++) {
-						u32 rgb = dnpr_shared_frame[(size_t)y *
-									 DNPR_WIDTH + j];
-						u32 color = drm_draw_color_from_xrgb8888(
-								rgb, sb->format->format);
+					if (native_xrgb8888) {
+						set_pixels(sb, run, y,
+							   &dnpr_shared_frame[(size_t)y *
+									      DNPR_WIDTH + run],
+							   x - run);
+						DNPR_BLIT_ACCOUNT((size_t)(x - run) * cpp, 1);
+					} else {
+						for (j = run; j < x; j++) {
+							u32 rgb = dnpr_shared_frame[(size_t)y *
+										 DNPR_WIDTH + j];
+							u32 color = drm_draw_color_from_xrgb8888(
+									rgb, sb->format->format);
 
-						memcpy(dnpr_row + j * cpp, &color, cpp);
+							memcpy(dnpr_row + j * cpp, &color, cpp);
+						}
+						set_pixels(sb, run, y,
+							   (const u32 *)(dnpr_row + run * cpp),
+							   x - run);
+						DNPR_BLIT_ACCOUNT((size_t)(x - run) * cpp, 1);
 					}
-					set_pixels(sb, run, y,
-						   (const u32 *)(dnpr_row + run * cpp),
-						   x - run);
 				}
+				continue;
+			}
+			if (!set_pixel && native_xrgb8888) {
+				unsigned int x0 = dnpr_shared_rects[i].x0;
+				unsigned int x1 = dnpr_shared_rects[i].x1;
+
+				iosys_map_memcpy_to(&sb->map[0],
+					(size_t)y * sb->pitch[0] + x0 * cpp,
+					&dnpr_shared_frame[(size_t)y * DNPR_WIDTH + x0],
+					(x1 - x0) * cpp);
+				DNPR_BLIT_ACCOUNT((size_t)(x1 - x0) * cpp, 1);
 				continue;
 			}
 			for (x = dnpr_shared_rects[i].x0;
@@ -54,21 +79,26 @@ static void dnpr_blit_shared(struct drm_scanout_buffer *sb, bool initial,
 				    !dnpr_shared_dirty[index])
 					continue;
 				rgb = dnpr_shared_frame[index];
-				color = drm_draw_color_from_xrgb8888(rgb,
-								 sb->format->format);
+				color = native_xrgb8888 ? rgb :
+					drm_draw_color_from_xrgb8888(rgb,
+								     sb->format->format);
 
-				if (set_pixel)
+				if (set_pixel) {
 					set_pixel(sb, x, y, color);
-				else
+					DNPR_BLIT_ACCOUNT(cpp, 1);
+				} else {
 					memcpy(dnpr_row + x * cpp, &color, cpp);
+				}
 			}
-			if (!set_pixel)
+			if (!set_pixel) {
+				unsigned int x0 = dnpr_shared_rects[i].x0;
+				unsigned int x1 = dnpr_shared_rects[i].x1;
+
 				iosys_map_memcpy_to(&sb->map[0],
-					(size_t)y * sb->pitch[0] +
-					dnpr_shared_rects[i].x0 * cpp,
-					dnpr_row + dnpr_shared_rects[i].x0 * cpp,
-					(dnpr_shared_rects[i].x1 -
-					 dnpr_shared_rects[i].x0) * cpp);
+					(size_t)y * sb->pitch[0] + x0 * cpp,
+					dnpr_row + x0 * cpp, (x1 - x0) * cpp);
+				DNPR_BLIT_ACCOUNT((size_t)(x1 - x0) * cpp, 1);
+			}
 		}
 	}
 }

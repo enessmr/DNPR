@@ -1,3 +1,21 @@
+static u32 dnpr_rgb565_to_xrgb8888[1U << 16];
+
+static void dnpr_prepare_rgb565_lut(void)
+{
+	unsigned int p;
+
+	for (p = 0; p < ARRAY_SIZE(dnpr_rgb565_to_xrgb8888); p++) {
+		unsigned int r = (p >> 11) & 31;
+		unsigned int g = (p >> 5) & 63;
+		unsigned int b = p & 31;
+
+		dnpr_rgb565_to_xrgb8888[p] =
+			(((r << 3) | (r >> 2)) << 16) |
+			(((g << 2) | (g >> 4)) << 8) |
+			((b << 3) | (b >> 2));
+	}
+}
+
 static bool dnpr_shared_rects_touch(const struct dnpr_rect *a,
 				    const struct dnpr_rect *b)
 {
@@ -90,10 +108,7 @@ static void dnpr_render_shared_rect(const struct dnpr_sprite *sprites,
 	for (y = rect->y0; y < rect->y1; y++) {
 		for (x = rect->x0; x < rect->x1; x++) {
 			size_t index = (size_t)y * DNPR_WIDTH + x;
-			u16 p = dnpr_base[index];
-			u32 rgb = (((((p >> 11) & 31) << 3 | ((p >> 11) & 31) >> 2) << 16) |
-				   ((((p >> 5) & 63) << 2 | ((p >> 5) & 63) >> 4) << 8) |
-				   ((p & 31) << 3 | (p & 31) >> 2));
+			u32 rgb = dnpr_rgb565_to_xrgb8888[dnpr_base[index]];
 
 			if (!initial && dnpr_shared_dirty &&
 			    dnpr_shared_frame[index] != rgb)
