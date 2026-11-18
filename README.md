@@ -22,8 +22,6 @@ The legacy preview (`--legacy-preview`) renders the local SuperGodot64 head geom
 
 Build the demo with `make`. Requirements include Python 3, NumPy, Pillow, SDL2 development files, and local SuperGodot64 assets, ROM, and `libsm64.so`. Set `SUPERGODOT64_ROOT` if the project is outside its default location. Generated assets and preview binaries are not committed.
 
-**Note:** This demo may not be compiled for now, since the source code is not up-to-date.
-
 Useful commands:
 
 ```sh
