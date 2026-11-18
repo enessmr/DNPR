@@ -24,12 +24,10 @@ scene.bin: export_scene.py
 gameover_audio.bin: export_audio.py
 	python3 export_audio.py --source-root $(SUPERGODOT64_ROOT) --output $@
 
-kernel/dnpr_frame_blob.h kernel/dnpr_live_blob.h kernel/dnpr_audio_blob.h &: .dnpr-asset-builder export_panic_scene.py export_panic_mesh.py export_panic_audio.py
-	./.dnpr-asset-builder --render-base-frame .dnpr-panic-base.ppm
-	python3 export_panic_scene.py .dnpr-panic-base.ppm scene.bin kernel/dnpr_frame_blob.h
+kernel/dnpr_frame_blob.h kernel/dnpr_live_blob.h kernel/dnpr_audio_blob.h &: export_panic_scene.py export_panic_mesh.py export_panic_audio.py mario_head.bin scene.bin gameover_audio.bin
+	python3 export_panic_scene.py scene.bin kernel/dnpr_frame_blob.h
 	python3 export_panic_mesh.py mario_head.bin scene.bin kernel/dnpr_live_blob.h
 	python3 export_panic_audio.py --input gameover_audio.bin --output kernel/dnpr_audio_blob.h
-	rm .dnpr-panic-base.ppm
 
 kernel/dnpr_spec_blob.h: gen_spec_lut.py
 	python3 gen_spec_lut.py

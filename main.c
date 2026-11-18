@@ -874,7 +874,13 @@ int main(int argc,char **argv){
     }
     signal(SIGINT,on_signal);signal(SIGTERM,on_signal);
     uint64_t start=SDL_GetPerformanceCounter();double freq=(double)SDL_GetPerformanceFrequency();
-    uint64_t next_frame=start+(uint64_t)(freq*6944444.0/1000000000.0);
+    SDL_DisplayMode preview_mode;int refresh=60;
+    if(!SDL_GetCurrentDisplayMode(display,&preview_mode)&&preview_mode.refresh_rate>0)
+        refresh=preview_mode.refresh_rate;
+    if(refresh<30)refresh=30;
+    double frame_ns=1000000000.0/(refresh>144?144:refresh);
+    if(frame_ns<6944444.0)frame_ns=6944444.0;
+    uint64_t next_frame=start+(uint64_t)(freq*frame_ns/1000000000.0);
     unsigned debug_frame=0;
     unsigned step_frame=0,step_pending=0;
     bool first_step_frame=true;
@@ -921,7 +927,7 @@ int main(int argc,char **argv){
         now=SDL_GetPerformanceCounter();
         double sec=frame_step?step_frame/30.0:(now-start)/freq;
         if(panic_mode&&!frame_step){
-            next_frame=now+(uint64_t)(freq*6944444.0/1000000000.0);
+            next_frame=now+(uint64_t)(freq*frame_ns/1000000000.0);
         }
         if(panic_mode){
 #ifndef DNPR_ASSET_BUILDER

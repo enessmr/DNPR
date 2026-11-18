@@ -83,12 +83,22 @@ static u8 *dnpr_shared_dirty;
 static bool dnpr_shared_valid;
 static bool dnpr_ready;
 
-/* Opt-in panic-time raster fan-out. The panic CPU parks the other CPUs in
- * IPI callbacks before normal shutdown. Workers and the panic CPU claim
- * disjoint 32-row bands; a timed-out frame stops the helpers before the
- * single-CPU redraw reuses shared vertex and depth buffers. */
+/* Opt-in panic-time raster fan-out. The panic CPU joins helper CPUs in the
+ * 32-row queue after one other CPU is reserved for HDA audio timing. A
+ * timed-out frame stops the helpers before the single-CPU redraw reuses
+ * shared vertex and depth buffers. */
 static bool dnpr_smp;
 module_param_named(smp, dnpr_smp, bool, 0444);
+
+/* Animation pacing in frames per second, clamped to the 144 Hz ceiling
+ * below. The default matches a 60 Hz panel; boot with
+ * dnpr_panic.frame_hz=144 for a faster scanout. */
+static unsigned int dnpr_frame_hz = 60;
+module_param_named(frame_hz, dnpr_frame_hz, uint, 0444);
+/* HDA panic playback is opt-in until the direct controller takeover has
+ * been confirmed clean on this hardware. */
+static bool dnpr_audio_enabled;
+module_param_named(audio, dnpr_audio_enabled, bool, 0444);
 static bool dnpr_smp_selftest;
 module_param_named(smp_selftest, dnpr_smp_selftest, bool, 0444);
 
@@ -99,12 +109,17 @@ module_param_named(smp_selftest, dnpr_smp_selftest, bool, 0444);
 static atomic_t dnpr_band_next = ATOMIC_INIT(DNPR_BAND_COUNT);
 static atomic_t dnpr_raster_done = ATOMIC_INIT(0);
 static atomic_t dnpr_raster_alive = ATOMIC_INIT(0);
+static atomic_t dnpr_helper_slot_next = ATOMIC_INIT(0);
 static atomic_t dnpr_raster_stop = ATOMIC_INIT(0);
+static atomic_t dnpr_helper_bands = ATOMIC_INIT(0);
 static unsigned int dnpr_raster_gen;
 static unsigned int dnpr_helper_count;
-static unsigned int dnpr_governor_cpu;
+static unsigned int dnpr_helper_band_limit;
+static unsigned int dnpr_cpu_helper_slot[NR_CPUS];
+static unsigned int dnpr_audio_cpu = UINT_MAX;
 static bool dnpr_helpers_active;
 static bool dnpr_panic_workers_armed;
+static bool dnpr_raster_timed_out;
 
 /* Quantized 3D geometry. Positions are signed Q8 model coordinates; Z needs
  * 32 bits for the opening poses near -200. RGB
@@ -134,6 +149,15 @@ struct dnpr_rect {
 	unsigned int x0, y0, x1, y1;
 };
 
+/* Shared path tracks exact old/new sprite bounds so animation only revisits
+ * the pixels the overlays can actually change. */
+static struct dnpr_rect dnpr_shared_rects[DNPR_MAX_SPRITES * 2 + 3];
+static unsigned int dnpr_shared_rect_count;
+static struct dnpr_sprite dnpr_shared_prev_sprites[DNPR_MAX_SPRITES];
+static unsigned int dnpr_shared_prev_sprite_count;
+static unsigned int dnpr_shared_prev_bar_w;
+static bool dnpr_shared_prev_valid;
+
 #define DNPR_LIVE_BYTES (DNPR_BASE_BYTES + \
 	DNPR_LIVE_NT * sizeof(struct dnpr_live_triangle) + \
 	DNPR_LIVE_NF * DNPR_LIVE_NV * sizeof(struct dnpr_live_vertex))
@@ -144,7 +168,12 @@ static u16 *dnpr_live_owner;
 static u8 *dnpr_spec_lut;
 static struct dnpr_projected dnpr_projected[DNPR_LIVE_NV];
 static u16 dnpr_triangle_order[DNPR_LIVE_NT];
+static u16 dnpr_triangle_depths[DNPR_LIVE_NT];
+/* Triangle indices grouped by the 32-row raster bands they can touch. */
+static u16 dnpr_band_triangles[DNPR_BAND_COUNT][DNPR_LIVE_NT];
+static u16 dnpr_band_triangle_count[DNPR_BAND_COUNT];
 static u64 dnpr_last_pose_q = ~0ULL;
+static bool dnpr_head_bounds_valid;
 static struct {
 	int x0, y0, x1, y1;
 } dnpr_head_bounds, dnpr_head_dirty;
@@ -152,8 +181,26 @@ static struct {
 #include "dnpr_raster_core.h"
 #include "dnpr_raster_rows.h"
 
-static void dnpr_grab_bands(void)
+static void dnpr_grab_bands(bool helper)
 {
+	if (helper) {
+		unsigned int slot = READ_ONCE(dnpr_cpu_helper_slot[smp_processor_id()]);
+		unsigned int n;
+
+		/* Assign two fixed bands to every helper so the coordinator cannot
+		 * race through the fast queue before helpers get meaningful work. */
+		for (n = 0; n < 2; n++) {
+			unsigned int band = slot * 2 + n;
+			int y0 = band * (int)DNPR_BAND_H;
+
+			if (band >= (int)READ_ONCE(dnpr_helper_band_limit))
+				break;
+			dnpr_raster_rows(y0, min(y0 + (int)DNPR_BAND_H - 1,
+						 (int)DNPR_HEIGHT - 1));
+			atomic_inc(&dnpr_helper_bands);
+		}
+	}
+
 	for (;;) {
 		int band = atomic_fetch_inc(&dnpr_band_next);
 		int y0 = band * (int)DNPR_BAND_H;
@@ -162,15 +209,22 @@ static void dnpr_grab_bands(void)
 			return;
 		dnpr_raster_rows(y0, min(y0 + (int)DNPR_BAND_H - 1,
 					 (int)DNPR_HEIGHT - 1));
+		if (helper)
+			atomic_inc(&dnpr_helper_bands);
 	}
 }
 
 static void dnpr_raster_helper(void *unused)
 {
-	bool governor = smp_processor_id() == READ_ONCE(dnpr_governor_cpu);
 	unsigned int seen = READ_ONCE(dnpr_raster_gen);
 
 	(void)unused;
+	/* The HDA stop-clock CPU must never enter the raster worker, even if a
+	 * future caller accidentally includes it in an IPI target mask. */
+	if (smp_processor_id() == READ_ONCE(dnpr_audio_cpu))
+		return;
+	WRITE_ONCE(dnpr_cpu_helper_slot[smp_processor_id()],
+		   atomic_fetch_inc(&dnpr_helper_slot_next));
 	atomic_inc(&dnpr_raster_alive);
 #ifdef CONFIG_X86
 	if (READ_ONCE(dnpr_panic_workers_armed)) {
@@ -191,10 +245,7 @@ static void dnpr_raster_helper(void *unused)
 			break;
 		seen = gen;
 		smp_rmb(); /* projected vertices published before the bump */
-		if (governor)
-			dnpr_audio_maybe_stop(); /* audio owns this CPU */
-		else
-			dnpr_grab_bands();
+		dnpr_grab_bands(true);
 		atomic_inc_return(&dnpr_raster_done);
 	}
 	atomic_dec(&dnpr_raster_alive);
@@ -203,18 +254,27 @@ static void dnpr_raster_helper(void *unused)
 static void dnpr_raster_start_helpers(void)
 {
 	cpumask_t mask;
+	unsigned int audio_cpu;
 
 	if (!dnpr_smp || dnpr_helpers_active || num_online_cpus() < 3)
 		return;
 	cpumask_copy(&mask, cpu_online_mask);
 	cpumask_clear_cpu(smp_processor_id(), &mask);
+	/* Also reserve a CPU for the optional boot selftest path. The panic
+	 * handoff chooses again after excluding the panic CPU. */
+	audio_cpu = READ_ONCE(dnpr_audio_cpu);
+	if (audio_cpu >= nr_cpu_ids || !cpumask_test_cpu(audio_cpu, &mask)) {
+		audio_cpu = cpumask_last(&mask);
+		WRITE_ONCE(dnpr_audio_cpu, audio_cpu);
+	}
+	cpumask_clear_cpu(audio_cpu, &mask);
 	if (cpumask_empty(&mask))
 		return;
 	atomic_set(&dnpr_raster_stop, 0);
 	atomic_set(&dnpr_raster_alive, 0);
+	atomic_set(&dnpr_helper_slot_next, 0);
 	/* Exhausted queue: helpers that wake early rasterize nothing. */
 	atomic_set(&dnpr_band_next, DNPR_BAND_COUNT);
-	WRITE_ONCE(dnpr_governor_cpu, cpumask_first(&mask));
 	dnpr_helper_count = cpumask_weight(&mask);
 	preempt_disable();
 	/* wait=0: the IPIs queue and run as each target can; the raster
@@ -230,15 +290,25 @@ static void dnpr_raster_start_helpers(void)
 bool dnpr_panic_smp_arm(void)
 {
 	cpumask_t mask;
+	unsigned int cpu, audio_cpu = UINT_MAX;
 
 	if (!IS_ENABLED(CONFIG_X86) || !dnpr_smp || !READ_ONCE(dnpr_ready) ||
 	    num_online_cpus() < 3)
 		return false;
 	cpumask_copy(&mask, cpu_online_mask);
 	cpumask_clear_cpu(smp_processor_id(), &mask);
-	WRITE_ONCE(dnpr_governor_cpu, cpumask_first(&mask));
+	/* Keep one non-coordinator CPU dedicated to the HDA stop clock. The
+	 * panic CPU joins the row queue, giving 11 raster CPUs on a 12 CPU
+	 * machine. Choosing the last online CPU avoids assuming CPU numbering. */
+	for_each_cpu(cpu, &mask)
+		audio_cpu = cpu;
+	if (audio_cpu == UINT_MAX || cpumask_empty(&mask))
+		return false;
+	cpumask_clear_cpu(audio_cpu, &mask);
+	WRITE_ONCE(dnpr_audio_cpu, audio_cpu);
 	atomic_set(&dnpr_raster_stop, 0);
 	atomic_set(&dnpr_raster_alive, 0);
+	atomic_set(&dnpr_helper_slot_next, 0);
 	atomic_set(&dnpr_band_next, DNPR_BAND_COUNT);
 	WRITE_ONCE(dnpr_panic_workers_armed, true);
 	return true;
@@ -251,6 +321,17 @@ bool dnpr_panic_smp_armed(void)
 
 void dnpr_panic_smp_worker(void)
 {
+	if (smp_processor_id() == READ_ONCE(dnpr_audio_cpu)) {
+#ifdef CONFIG_X86
+		smp_wmb();
+		cpumask_clear_cpu(smp_processor_id(), &cpus_stop_mask);
+#endif
+		while (!atomic_read(&dnpr_raster_stop)) {
+			dnpr_audio_maybe_stop();
+			cpu_relax();
+		}
+		return;
+	}
 	dnpr_raster_helper(NULL);
 }
 
@@ -267,25 +348,41 @@ static void dnpr_raster_frame(void)
 	s64 deadline;
 
 	atomic_set(&dnpr_raster_done, 0);
-	atomic_set(&dnpr_band_next, 0);
+	WRITE_ONCE(dnpr_helper_band_limit,
+		   min_t(unsigned int, DNPR_BAND_COUNT,
+			 dnpr_helper_count * 2));
+	atomic_set(&dnpr_band_next, READ_ONCE(dnpr_helper_band_limit));
+	atomic_set(&dnpr_helper_bands, 0);
 	smp_wmb(); /* projected vertices and cleared buffers are ready */
 	WRITE_ONCE(dnpr_raster_gen, dnpr_raster_gen + 1);
-	dnpr_grab_bands(); /* the orchestrator joins the queue */
+	/* Helpers receive two guaranteed bands apiece before the coordinator and
+	 * helpers share the remaining queue. One more CPU polls HDA DMA. */
+	dnpr_grab_bands(false);
 	deadline = ktime_get_mono_fast_ns() +
 		(s64)DNPR_RASTER_TIMEOUT_MS * 1000000;
 	while ((done = atomic_read_acquire(&dnpr_raster_done)) < dnpr_helper_count &&
 	       ktime_get_mono_fast_ns() < deadline)
 		cpu_relax();
 	if (done < dnpr_helper_count) {
+		/* One grace window: a helper servicing an SMI or IRQ storm
+		 * recovers here instead of costing the SMP path for the rest
+		 * of the panic. */
+		deadline = ktime_get_mono_fast_ns() +
+			(s64)DNPR_RASTER_TIMEOUT_MS * 1000000;
+		while ((done = atomic_read_acquire(&dnpr_raster_done)) <
+		       dnpr_helper_count &&
+		       ktime_get_mono_fast_ns() < deadline)
+			cpu_relax();
+	}
+	if (done < dnpr_helper_count) {
+		dnpr_raster_timed_out = true;
 		/* A late helper might still be using the projected vertices.
 		 * Quiesce all helpers before recycling the frame buffers. */
 		atomic_set(&dnpr_raster_stop, 1);
 		WRITE_ONCE(dnpr_panic_workers_armed, false);
 		smp_send_stop();
 		dnpr_helpers_active = false;
-		memcpy(dnpr_base, dnpr_live_data, DNPR_BASE_BYTES);
-		memset(dnpr_live_depth, 0xff, DNPR_BASE_BYTES);
-		memset(dnpr_live_owner, 0xff, DNPR_BASE_BYTES);
+		dnpr_restore_live_head();
 		dnpr_raster_rows(0, DNPR_HEIGHT - 1);
 	}
 	smp_rmb();
@@ -406,6 +503,43 @@ static bool dnpr_scanout_ok(struct drm_scanout_buffer *sb)
 	return true;
 }
 
+/* Panic-only diagnostic: bright yellow means helpers shaded more than half
+ * the bands; dark yellow means half or fewer (including exactly half).
+ * Red means the raster timed out. Keep it outside the art for recordings. */
+static void dnpr_draw_smp_status(struct drm_scanout_buffer *sb)
+{
+	unsigned int x, y, cpp = sb->format->cpp[0];
+	void (*set_pixels)(struct drm_scanout_buffer *, unsigned int,
+			   unsigned int, const u32 *, unsigned int) = sb->set_pixels;
+	unsigned int helper_bands = atomic_read(&dnpr_helper_bands);
+	u32 rgb = dnpr_raster_timed_out ? 0x00ff0000 :
+		  helper_bands > DNPR_BAND_COUNT / 2 ? 0x00ffff00 :
+							   0x00a0a000;
+	u32 color = drm_draw_color_from_xrgb8888(rgb, sb->format->format);
+
+	if (sb->width < 48 || sb->height < 48)
+		return;
+	if (set_pixels) {
+		u32 *row = (u32 *)dnpr_row;
+
+		for (x = 0; x < 32; x++)
+			row[x] = color;
+		for (y = sb->height - 40; y < sb->height - 8; y++)
+			set_pixels(sb, 8, y, row, 32);
+	} else if (sb->set_pixel) {
+		for (y = sb->height - 40; y < sb->height - 8; y++)
+			for (x = 8; x < 40; x++)
+				sb->set_pixel(sb, x, y, color);
+	} else {
+		for (x = 0; x < 32; x++)
+			memcpy(dnpr_row + x * cpp, &color, cpp);
+		for (y = sb->height - 40; y < sb->height - 8; y++)
+			iosys_map_memcpy_to(&sb->map[0],
+					    (size_t)y * sb->pitch[0] + 8 * cpp,
+					    dnpr_row, 32 * cpp);
+	}
+}
+
 bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 {
 	unsigned int idx;
@@ -414,44 +548,62 @@ bool dnpr_panic_render(struct drm_scanout_buffer *sb)
 		return false;
 
 	/* The DRM dumper calls this for every plane before starting the shared
-	 * animation loop. Keep the scanout mapping and display its first frame.
-	 */
+	 * animation loop. Collect scanouts here; present one common first frame
+	 * only after every output has been registered. */
 	if (dnpr_sb_count < DNPR_MAX_SB)
 		idx = dnpr_sb_count++;
 	else
 		idx = DNPR_MAX_SB - 1;
 	dnpr_sb[idx] = *sb;
 	WRITE_ONCE(dnpr_sb_valid[idx], true);
-	dnpr_render_live_head(0);
-	if (dnpr_shared_frame && sb->width == DNPR_WIDTH &&
-	    sb->height == DNPR_HEIGHT) {
-		if (!dnpr_shared_valid)
-			dnpr_render_shared(0, 0, true, true);
-		dnpr_blit_shared(&dnpr_sb[idx], true, true);
-	} else {
-		dnpr_composite(&dnpr_sb[idx], 0, 0, true, true);
-	}
-	wmb();
 	return true;
 }
 
 void dnpr_panic_animate(void)
 {
-	u64 start_ns, next_ns, now_ns, wait_us;
+	u64 start_ns, next_ns, now_ns, wait_us, frame_ns;
 	unsigned int k, elapsed_ms;
 	bool head_changed;
 	bool native_scanout = false;
 
 	if (!READ_ONCE(dnpr_sb_count))
 		return;
+	/* Panel-matched pacing: helpers finish a band sweep well inside the
+	 * interval, so the scanout settles between refreshes instead of
+	 * tearing through two writes per displayed frame. */
+	frame_ns = dnpr_frame_hz ?
+		max(DNPR_FASTEST_FRAME_NS,
+		    1000000000ULL / dnpr_frame_hz) :
+		DNPR_FASTEST_FRAME_NS;
 	for (k = 0; k < dnpr_sb_count; k++)
 		if (READ_ONCE(dnpr_sb_valid[k]) &&
 		    dnpr_sb[k].width == DNPR_WIDTH &&
 		    dnpr_sb[k].height == DNPR_HEIGHT)
 			native_scanout = true;
+	/* Render and present the panic-trigger frame once, after all scanout
+	 * buffers are known. The per-plane callback only collects mappings, so
+	 * no output shows a separate pre-animation copy of the face. */
+	head_changed = dnpr_render_live_head(0);
+	if (native_scanout && dnpr_shared_frame)
+		dnpr_render_shared(0, dnpr_frame, true, head_changed);
+	for (k = 0; k < dnpr_sb_count; k++)
+		if (READ_ONCE(dnpr_sb_valid[k])) {
+			if (dnpr_shared_frame &&
+			    dnpr_sb[k].width == DNPR_WIDTH &&
+			    dnpr_sb[k].height == DNPR_HEIGHT)
+				dnpr_blit_shared(&dnpr_sb[k], true, head_changed);
+			else
+				dnpr_composite(&dnpr_sb[k], 0, dnpr_frame,
+					       true, head_changed);
+			dnpr_draw_smp_status(&dnpr_sb[k]);
+		}
+	wmb();
+	/* Start the animation clock only once the trigger frame is on scanout,
+	 * and hold that frame for one complete animation interval. */
 	start_ns = ktime_get_mono_fast_ns();
-	next_ns = start_ns + DNPR_FASTEST_FRAME_NS;
-	dnpr_audio_start();
+	next_ns = start_ns + frame_ns;
+	if (READ_ONCE(dnpr_audio_enabled))
+		dnpr_audio_start();
 	for (;;) {
 		now_ns = ktime_get_mono_fast_ns();
 		if (now_ns < next_ns) {
@@ -465,7 +617,7 @@ void dnpr_panic_animate(void)
 		elapsed_ms = min_t(u64,
 			(now_ns - start_ns) / 1000000,
 			~0U);
-		next_ns = now_ns + DNPR_FASTEST_FRAME_NS;
+		next_ns = now_ns + frame_ns;
 		dnpr_frame++;
 		head_changed = dnpr_render_live_head(elapsed_ms);
 		if (native_scanout && dnpr_shared_frame)
@@ -482,6 +634,7 @@ void dnpr_panic_animate(void)
 					dnpr_composite(&dnpr_sb[k], elapsed_ms,
 						       dnpr_frame, false,
 						       head_changed);
+				dnpr_draw_smp_status(&dnpr_sb[k]);
 			}
 		wmb();
 		dnpr_audio_maybe_stop();
@@ -490,6 +643,11 @@ void dnpr_panic_animate(void)
 
 /* Boot-time selftest: render reference poses on one CPU, render the same
  * poses through the SMP band queue, and CRC-compare the shared frame.
+ * Then time whole panic frames through the SMP path - head, compose, and
+ * the region-limited scanout blit into a scratch buffer - so the dmesg
+ * ceiling covers the real loop (vmalloc memory, helpers parked in IPI
+ * context) rather than a raster-only measurement. A live panic adds only
+ * the uncached framebuffer stores, which the region logic keeps partial.
  * Helpers are parked afterwards, so a panic later in the same boot falls
  * back to the uniprocessor draw. Boot with dnpr_panic.smp_selftest=1 once
  * and read the results from dmesg.
@@ -497,6 +655,10 @@ void dnpr_panic_animate(void)
 static int __init dnpr_smp_selftest_run(void)
 {
 	static const unsigned int poses[3] = { 0, 60, 105 };
+	static const struct drm_format_info xrgb8888 = {
+		.format = DRM_FORMAT_XRGB8888,
+		.cpp = { 4 },
+	};
 	u32 crc[3][2];
 	unsigned int k;
 
@@ -521,6 +683,72 @@ static int __init dnpr_smp_selftest_run(void)
 			div64_u64(ktime_get_mono_fast_ns() - t0, 1000),
 			atomic_read(&dnpr_raster_alive), dnpr_helper_count,
 			same ? "identical" : "MISMATCH");
+	}
+
+	/* Panic-frame ceiling through the SMP path. The scratch scanout is
+	 * vmalloc like the panic buffers, so the blit cost here brackets the
+	 * cached part of the real framebuffer write. */
+	{
+		u32 *sink = vmalloc(DNPR_BASE_BYTES * 2);
+		struct drm_scanout_buffer sb = {
+			.width = DNPR_WIDTH,
+			.height = DNPR_HEIGHT,
+			.pitch[0] = DNPR_WIDTH * 4,
+			.format = &xrgb8888,
+			.map[0].vaddr = sink,
+		};
+
+		if (sink && dnpr_scanout_ok(&sb)) {
+			u64 head_us = 0, compose_us = 0, blit_us = 0;
+
+			dnpr_render_shared(0, 0, true, true);
+			dnpr_blit_shared(&sb, true, true);
+			for (k = 0; k < 3; k++) {
+				unsigned int elapsed = poses[k] * 1000U / 30U;
+				u64 t0 = ktime_get_mono_fast_ns(), t1, t2;
+				bool head_changed;
+
+				WRITE_ONCE(dnpr_last_pose_q, ~0ULL);
+				head_changed = dnpr_render_live_head(elapsed);
+				t1 = ktime_get_mono_fast_ns();
+				dnpr_render_shared(elapsed, dnpr_frame++, false,
+						   head_changed);
+				t2 = ktime_get_mono_fast_ns();
+				dnpr_blit_shared(&sb, false, head_changed);
+				head_us += t1 - t0;
+				compose_us += t2 - t1;
+				blit_us += ktime_get_mono_fast_ns() - t2;
+			}
+			pr_info("DNPR panic frame: head %llu us, compose %llu us, blit %llu us, total %llu us -> %llu fps ceiling (helpers %u/%u)\n",
+				div64_u64(head_us, 3), div64_u64(compose_us, 3),
+				div64_u64(blit_us, 3),
+				div64_u64(head_us + compose_us + blit_us, 3),
+				div64_u64(3000000ULL,
+					  head_us + compose_us + blit_us),
+				atomic_read(&dnpr_raster_alive),
+				dnpr_helper_count);
+			/* Settled frame: the pose is unchanged, so only the
+			 * compose and blit run. */
+			{
+				unsigned int elapsed = poses[2] * 1000U / 30U;
+				u64 t0 = ktime_get_mono_fast_ns(), t1, t2, total;
+
+				dnpr_render_live_head(elapsed);
+				t1 = ktime_get_mono_fast_ns();
+				dnpr_render_shared(elapsed, dnpr_frame++, false,
+						   false);
+				t2 = ktime_get_mono_fast_ns();
+				dnpr_blit_shared(&sb, false, false);
+				total = t1 - t0 + t2 - t1 +
+					(ktime_get_mono_fast_ns() - t2);
+				pr_info("DNPR settled frame: %llu us -> %llu fps ceiling\n",
+					div64_u64(total, 1),
+					total ? div64_u64(1000000ULL, total) : 0);
+			}
+		} else {
+			pr_warn("DNPR selftest: scratch scanout unavailable; frame timing skipped\n");
+		}
+		vfree(sink);
 	}
 	atomic_inc(&dnpr_raster_stop);
 	dnpr_helpers_active = false;

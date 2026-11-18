@@ -36,6 +36,19 @@
  drm-$(CONFIG_DRM_DRAW) += drm_draw.o
  drm-$(CONFIG_DRM_PANIC_SCREEN_QR_CODE) += drm_panic_qr.o
  obj-$(CONFIG_DRM)	+= drm.o
+--- a/include/drm/drm_panic.h
++++ b/include/drm/drm_panic.h
+@@ -64,0 +65,8 @@
++	/**
++	 * @set_pixels: Optional function to write a horizontal span of pixels.
++	 * The colors use the scanout buffer's native format. Drivers may split
++	 * the span at tile boundaries when writing tiled framebuffers.
++	 */
++	void (*set_pixels)(struct drm_scanout_buffer *sb, unsigned int x,
++			   unsigned int y, const u32 *colors,
++			   unsigned int count);
+ };
+
 --- a/drivers/gpu/drm/drm_panic.c
 +++ b/drivers/gpu/drm/drm_panic.c
 @@ -32,6 +32,9 @@

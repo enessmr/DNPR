@@ -104,7 +104,7 @@
  /*
   * The two arrays below specify the PQ EOTF transfer function that's used to
   * convert from PQ encoded L'M'S' fixed-point to linear LMS FP16. This transfer
-@@ -2072,6 +2078,98 @@
+@@ -2072,6 +2078,124 @@
      .atomic_check   = nv_drm_plane_atomic_check,
  };
  
@@ -130,6 +130,30 @@
 +    off = blk_off + in_blk_x * 4 + in_blk_y * NV_TILE_GOB_WIDTH_BYTES;
 +
 +    iosys_map_wr(&sb->map[0], off, u32, color);
++}
++
++static void nv_drm_panic_set_pixels(struct drm_scanout_buffer *sb,
++                                    unsigned int x, unsigned int y,
++                                    const u32 *colors, unsigned int count)
++{
++    u32 blk_columns = DIV_ROUND_UP(sb->pitch[0], NV_TILE_GOB_WIDTH_BYTES);
++
++    while (count) {
++        u32 blk_x = (x * 4) / NV_TILE_GOB_WIDTH_BYTES;
++        u32 blk_y = y / nv_panic_blk_h;
++        u32 blk_off = ((blk_y * blk_columns) + blk_x) *
++                      (NV_TILE_GOB_WIDTH_BYTES * nv_panic_blk_h);
++        u32 in_blk_x = x % (NV_TILE_GOB_WIDTH_BYTES / 4);
++        u32 in_blk_y = y % nv_panic_blk_h;
++        u32 off = blk_off + in_blk_x * 4 + in_blk_y * NV_TILE_GOB_WIDTH_BYTES;
++        u32 span = min_t(u32, count,
++                         NV_TILE_GOB_WIDTH_BYTES / 4 - in_blk_x);
++
++        iosys_map_memcpy_to(&sb->map[0], off, colors, span * sizeof(*colors));
++        x += span;
++        colors += span;
++        count -= span;
++    }
 +}
 +
 +static int nv_drm_primary_plane_get_scanout_buffer(struct drm_plane *plane,
@@ -181,8 +205,10 @@
 +        if (fb->format->cpp[0] != 4)
 +            return -EOPNOTSUPP;
 +        sb->set_pixel = nv_drm_panic_set_pixel;
++        sb->set_pixels = nv_drm_panic_set_pixels;
 +    } else {
 +        sb->set_pixel = NULL;
++        sb->set_pixels = NULL;
 +    }
 +
 +    return 0;

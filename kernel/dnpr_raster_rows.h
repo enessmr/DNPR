@@ -1,17 +1,20 @@
 static void dnpr_raster_rows(int y0, int y1)
 {
 	const struct dnpr_live_triangle *t = dnpr_tris();
-	unsigned int i;
+	unsigned int band;
 
-	for (i = 0; i < DNPR_LIVE_NT; i++) {
-		unsigned int index = dnpr_triangle_order[i];
+	for (band = y0 / DNPR_BAND_H; band <= y1 / DNPR_BAND_H; band++) {
+		int band_y0 = max(y0, (int)(band * DNPR_BAND_H));
+		int band_y1 = min(y1, (int)((band + 1) * DNPR_BAND_H - 1));
+		unsigned int i;
 
-		if (t[index].a >= DNPR_LIVE_NV || t[index].b >= DNPR_LIVE_NV ||
-		    t[index].c >= DNPR_LIVE_NV)
-			continue;
-		dnpr_draw_live_triangle(&dnpr_projected[t[index].a],
-					&dnpr_projected[t[index].b],
-					&dnpr_projected[t[index].c], &t[index],
-					y0, y1);
+		for (i = 0; i < dnpr_band_triangle_count[band]; i++) {
+			unsigned int index = dnpr_band_triangles[band][i];
+
+			dnpr_draw_live_triangle(&dnpr_projected[t[index].a],
+						&dnpr_projected[t[index].b],
+						&dnpr_projected[t[index].c], &t[index],
+						band_y0, band_y1);
+		}
 	}
 }

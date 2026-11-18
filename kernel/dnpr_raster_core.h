@@ -8,32 +8,32 @@ static u16 dnpr_rgb565(unsigned int r, unsigned int g, unsigned int b)
 	return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
 }
 
-/* Divide by the triangle's invariant area without a per-pixel DIV. The
- * 48-bit reciprocal handles screen-sized triangles with a 64-bit product;
- * larger triangles use the 64-bit reciprocal. The remainder restores the
- * exact truncating quotient.
- */
-static s64 dnpr_div_by_area(s64 n, u64 area, u64 reciprocal)
+/* Q24 plane values let the scan converter step all attributes across a row
+ * with additions instead of doing a reciprocal multiply for every pixel. */
+static s64 dnpr_div_by_area_q24(s64 n, u64 area, u64 reciprocal)
 {
 	u64 magnitude, quotient;
 
-	if (area == 1)
-		return n;
+	if (!n || area == 1)
+		return n * (1LL << 24);
 	magnitude = n < 0 ? 0 - (u64)n : (u64)n;
-	quotient = area <= 0xffffffffULL ?
-		(magnitude * reciprocal >> 48) :
-		mul_u64_u64_shr(magnitude, reciprocal, 64);
-	if (magnitude - quotient * area >= area)
-		quotient++;
+	if (area <= 0xffffffffULL) {
+		quotient = mul_u64_u64_shr(magnitude, reciprocal, 24);
+		if ((magnitude << 24) - quotient * area >= area)
+			quotient++;
+	} else {
+		quotient = div64_u64(magnitude << 24, area);
+	}
 	return n < 0 ? -(s64)quotient : (s64)quotient;
 }
 
-static unsigned int dnpr_specular(s64 weighted_nx, s64 weighted_ny,
-				 s64 weighted_nz, s64 area, u64 reciprocal)
+static s64 dnpr_q24_to_s64(s64 value)
 {
-	s64 nx = dnpr_div_by_area(weighted_nx, area, reciprocal);
-	s64 ny = dnpr_div_by_area(weighted_ny, area, reciprocal);
-	s64 nz = dnpr_div_by_area(weighted_nz, area, reciprocal);
+	return value < 0 ? -((-value) >> 24) : value >> 24;
+}
+
+static unsigned int dnpr_specular(s64 nx, s64 ny, s64 nz)
+{
 	u64 length, q;
 	s64 h;
 	int i;
@@ -142,15 +142,29 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 				 a->y - c->y);
 	step0 = (s64)sign * (c->y - b->y);
 	step1 = (s64)sign * (a->y - c->y);
-	dz = step0 * ((s64)a->z - c->z) + step1 * ((s64)b->z - c->z);
+	dz = dnpr_div_by_area_q24(
+			step0 * ((s64)a->z - c->z) +
+			step1 * ((s64)b->z - c->z), area, reciprocal);
 	dr = dg = db = dnx = dny = dnz = 0;
 	if (!unshaded) {
-		dr = step0 * ((s64)a->lr - c->lr) + step1 * ((s64)b->lr - c->lr);
-		dg = step0 * ((s64)a->lg - c->lg) + step1 * ((s64)b->lg - c->lg);
-		db = step0 * ((s64)a->lb - c->lb) + step1 * ((s64)b->lb - c->lb);
-		dnx = step0 * ((s64)a->nx - c->nx) + step1 * ((s64)b->nx - c->nx);
-		dny = step0 * ((s64)a->ny - c->ny) + step1 * ((s64)b->ny - c->ny);
-		dnz = step0 * ((s64)a->nz - c->nz) + step1 * ((s64)b->nz - c->nz);
+		dr = dnpr_div_by_area_q24(
+			step0 * ((s64)a->lr - c->lr) +
+			step1 * ((s64)b->lr - c->lr), area, reciprocal);
+		dg = dnpr_div_by_area_q24(
+			step0 * ((s64)a->lg - c->lg) +
+			step1 * ((s64)b->lg - c->lg), area, reciprocal);
+		db = dnpr_div_by_area_q24(
+			step0 * ((s64)a->lb - c->lb) +
+			step1 * ((s64)b->lb - c->lb), area, reciprocal);
+		dnx = dnpr_div_by_area_q24(
+			step0 * ((s64)a->nx - c->nx) +
+			step1 * ((s64)b->nx - c->nx), area, reciprocal);
+		dny = dnpr_div_by_area_q24(
+			step0 * ((s64)a->ny - c->ny) +
+			step1 * ((s64)b->ny - c->ny), area, reciprocal);
+		dnz = dnpr_div_by_area_q24(
+			step0 * ((s64)a->nz - c->nz) +
+			step1 * ((s64)b->nz - c->nz), area, reciprocal);
 	}
 	for (y = y0; y <= y1; y++) {
 		s64 left = 0, right = 0, w0, w1;
@@ -181,20 +195,27 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 					span_x0, y);
 		w1 = sign * dnpr_edge(c->x, c->y, a->x, a->y,
 					span_x0, y);
-		wz = (s64)area * c->z + w0 * ((s64)a->z - c->z) +
-			w1 * ((s64)b->z - c->z);
-		wr = (s64)area * c->lr + w0 * ((s64)a->lr - c->lr) +
-			w1 * ((s64)b->lr - c->lr);
-		wg = (s64)area * c->lg + w0 * ((s64)a->lg - c->lg) +
-			w1 * ((s64)b->lg - c->lg);
-		wb = (s64)area * c->lb + w0 * ((s64)a->lb - c->lb) +
-			w1 * ((s64)b->lb - c->lb);
-		wnx = (s64)area * c->nx + w0 * ((s64)a->nx - c->nx) +
-			w1 * ((s64)b->nx - c->nx);
-		wny = (s64)area * c->ny + w0 * ((s64)a->ny - c->ny) +
-			w1 * ((s64)b->ny - c->ny);
-		wnz = (s64)area * c->nz + w0 * ((s64)a->nz - c->nz) +
-			w1 * ((s64)b->nz - c->nz);
+		wz = dnpr_div_by_area_q24((s64)area * c->z +
+			w0 * ((s64)a->z - c->z) + w1 * ((s64)b->z - c->z),
+			area, reciprocal);
+		wr = unshaded ? 0 : dnpr_div_by_area_q24((s64)area * c->lr +
+			w0 * ((s64)a->lr - c->lr) + w1 * ((s64)b->lr - c->lr),
+			area, reciprocal);
+		wg = unshaded ? 0 : dnpr_div_by_area_q24((s64)area * c->lg +
+			w0 * ((s64)a->lg - c->lg) + w1 * ((s64)b->lg - c->lg),
+			area, reciprocal);
+		wb = unshaded ? 0 : dnpr_div_by_area_q24((s64)area * c->lb +
+			w0 * ((s64)a->lb - c->lb) + w1 * ((s64)b->lb - c->lb),
+			area, reciprocal);
+		wnx = unshaded ? 0 : dnpr_div_by_area_q24((s64)area * c->nx +
+			w0 * ((s64)a->nx - c->nx) + w1 * ((s64)b->nx - c->nx),
+			area, reciprocal);
+		wny = unshaded ? 0 : dnpr_div_by_area_q24((s64)area * c->ny +
+			w0 * ((s64)a->ny - c->ny) + w1 * ((s64)b->ny - c->ny),
+			area, reciprocal);
+		wnz = unshaded ? 0 : dnpr_div_by_area_q24((s64)area * c->nz +
+			w0 * ((s64)a->nz - c->nz) + w1 * ((s64)b->nz - c->nz),
+			area, reciprocal);
 		for (x = span_x0; x <= span_x1; x++) {
 			s64 w2;
 			unsigned int z, sr, sg, sb, spec, r, g, blue;
@@ -206,7 +227,7 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 			if (w2 < 0)
 				goto next_pixel;
 			index = (size_t)y * DNPR_WIDTH + x;
-			z = dnpr_div_by_area(wz, area, reciprocal);
+			z = dnpr_q24_to_s64(wz);
 			if (z > dnpr_live_depth[index] ||
 			    (z == dnpr_live_depth[index] &&
 			     (dnpr_live_owner[index] == 0xffff ||
@@ -219,11 +240,13 @@ static void dnpr_draw_live_triangle(const struct dnpr_projected *a,
 							tri->blue);
 				goto next_pixel;
 			}
-			sr = dnpr_div_by_area(wr, area, reciprocal);
-			sg = dnpr_div_by_area(wg, area, reciprocal);
-			sb = dnpr_div_by_area(wb, area, reciprocal);
+			sr = dnpr_q24_to_s64(wr);
+			sg = dnpr_q24_to_s64(wg);
+			sb = dnpr_q24_to_s64(wb);
 			spec = no_specular || DNPR_NO_SPECULAR ? 0 :
-				dnpr_specular(wnx, wny, wnz, area, reciprocal);
+				dnpr_specular(dnpr_q24_to_s64(wnx),
+					      dnpr_q24_to_s64(wny),
+					      dnpr_q24_to_s64(wnz));
 			r = min(255U, (tri->r * sr >> 8) + spec);
 			g = min(255U, (tri->g * sg >> 8) + spec);
 			blue = min(255U, (tri->blue * sb >> 8) + spec);
@@ -263,6 +286,29 @@ static unsigned int dnpr_triangle_depth(unsigned int index)
 		    dnpr_projected[tri->b].z, dnpr_projected[tri->c].z);
 }
 
+static void dnpr_restore_live_head(void)
+{
+	int y;
+
+	for (y = dnpr_head_dirty.y0; y < dnpr_head_dirty.y1; y++) {
+		size_t offset = (size_t)y * DNPR_WIDTH + dnpr_head_dirty.x0;
+		unsigned int width = dnpr_head_dirty.x1 - dnpr_head_dirty.x0;
+
+		memcpy(dnpr_base + offset,
+		       (const u16 *)dnpr_live_data + offset,
+		       width * sizeof(*dnpr_base));
+	}
+	for (y = dnpr_head_bounds.y0; y < dnpr_head_bounds.y1; y++) {
+		size_t offset = (size_t)y * DNPR_WIDTH + dnpr_head_bounds.x0;
+		unsigned int width = dnpr_head_bounds.x1 - dnpr_head_bounds.x0;
+
+		memset(dnpr_live_depth + offset, 0xff,
+		       width * sizeof(*dnpr_live_depth));
+		memset(dnpr_live_owner + offset, 0xff,
+		       width * sizeof(*dnpr_live_owner));
+	}
+}
+
 static bool dnpr_render_live_head_prepare(unsigned int elapsed_ms)
 {
 	const struct dnpr_live_vertex *verts, *next_verts;
@@ -274,9 +320,6 @@ static bool dnpr_render_live_head_prepare(unsigned int elapsed_ms)
 	if (pose_q == dnpr_last_pose_q)
 		return false;
 	dnpr_last_pose_q = pose_q;
-	memcpy(dnpr_base, dnpr_live_data, DNPR_BASE_BYTES);
-	memset(dnpr_live_depth, 0xff, DNPR_BASE_BYTES);
-	memset(dnpr_live_owner, 0xff, DNPR_BASE_BYTES);
 	verts = (const void *)(dnpr_live_data + DNPR_BASE_BYTES +
 		DNPR_LIVE_NT * sizeof(struct dnpr_live_triangle) +
 		pose * DNPR_LIVE_NV * sizeof(*verts));
@@ -311,29 +354,63 @@ static bool dnpr_render_live_head_prepare(unsigned int elapsed_ms)
 	y0 = clamp(y0 - 2, 0, (int)DNPR_HEIGHT);
 	x1 = clamp(x1 + 3, 0, (int)DNPR_WIDTH);
 	y1 = clamp(y1 + 3, 0, (int)DNPR_HEIGHT);
-	dnpr_head_dirty.x0 = min(x0, dnpr_head_bounds.x0);
-	dnpr_head_dirty.y0 = min(y0, dnpr_head_bounds.y0);
-	dnpr_head_dirty.x1 = max(x1, dnpr_head_bounds.x1);
-	dnpr_head_dirty.y1 = max(y1, dnpr_head_bounds.y1);
+	dnpr_head_dirty.x0 = dnpr_head_bounds_valid ?
+		min(x0, dnpr_head_bounds.x0) : x0;
+	dnpr_head_dirty.y0 = dnpr_head_bounds_valid ?
+		min(y0, dnpr_head_bounds.y0) : y0;
+	dnpr_head_dirty.x1 = dnpr_head_bounds_valid ?
+		max(x1, dnpr_head_bounds.x1) : x1;
+	dnpr_head_dirty.y1 = dnpr_head_bounds_valid ?
+		max(y1, dnpr_head_bounds.y1) : y1;
 	dnpr_head_bounds.x0 = x0;
 	dnpr_head_bounds.y0 = y0;
 	dnpr_head_bounds.x1 = x1;
 	dnpr_head_bounds.y1 = y1;
-	for (i = 0; i < DNPR_LIVE_NT; i++)
+	dnpr_head_bounds_valid = true;
+	/* Restore the old and new head area, clearing depth only where current
+	 * geometry can land. */
+	dnpr_restore_live_head();
+	memset(dnpr_band_triangle_count, 0, sizeof(dnpr_band_triangle_count));
+	for (i = 0; i < DNPR_LIVE_NT; i++) {
 		dnpr_triangle_order[i] = i;
+		dnpr_triangle_depths[i] = dnpr_triangle_depth(i);
+	}
 	for (unsigned int gap = DNPR_LIVE_NT / 2; gap; gap /= 2)
 		for (i = gap; i < DNPR_LIVE_NT; i++) {
 			u16 item = dnpr_triangle_order[i];
-			unsigned int depth = dnpr_triangle_depth(item);
+			u16 depth = dnpr_triangle_depths[item];
 			unsigned int cursor = i;
 
 			while (cursor >= gap &&
-			       dnpr_triangle_depth(dnpr_triangle_order[cursor - gap]) > depth) {
+			       dnpr_triangle_depths[
+				       dnpr_triangle_order[cursor - gap]] > depth) {
 				dnpr_triangle_order[cursor] = dnpr_triangle_order[cursor - gap];
 				cursor -= gap;
 			}
 			dnpr_triangle_order[cursor] = item;
 		}
+	/* Keep the near-to-far order within each band, while excluding triangles
+	 * whose projected bounds cannot touch that band. */
+	for (i = 0; i < DNPR_LIVE_NT; i++) {
+		const struct dnpr_live_triangle *t = dnpr_tris();
+		unsigned int index = dnpr_triangle_order[i];
+		int first, last, band;
+
+		if (t[index].a >= DNPR_LIVE_NV || t[index].b >= DNPR_LIVE_NV ||
+		    t[index].c >= DNPR_LIVE_NV)
+			continue;
+		first = clamp_t(int, min3(dnpr_projected[t[index].a].y,
+					 dnpr_projected[t[index].b].y,
+					 dnpr_projected[t[index].c].y),
+				 0, DNPR_HEIGHT - 1) / DNPR_BAND_H;
+		last = clamp_t(int, max3(dnpr_projected[t[index].a].y,
+					 dnpr_projected[t[index].b].y,
+					 dnpr_projected[t[index].c].y),
+				 0, DNPR_HEIGHT - 1) / DNPR_BAND_H;
+		for (band = first; band <= last; band++)
+			dnpr_band_triangles[band][dnpr_band_triangle_count[band]++] =
+				index;
+	}
 	return true;
 }
 

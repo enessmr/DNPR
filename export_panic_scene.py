@@ -12,10 +12,9 @@ import struct
 import zlib
 from pathlib import Path
 
-from PIL import Image
+import numpy as np
 
 parser = argparse.ArgumentParser()
-parser.add_argument('base', type=Path)
 parser.add_argument('scene', type=Path)
 parser.add_argument('header', type=Path)
 args = parser.parse_args()
@@ -29,15 +28,6 @@ BG_BYTES = 4 * 1200 * 300 * 3
 
 magic0 = struct.unpack('<I', b'DNPR')[0]
 magic1 = struct.unpack('<I', b'K001')[0]
-
-base = Image.open(args.base).convert('RGB')
-if base.size != (1920, 1080):
-    raise SystemExit('base frame must be 1920x1080')
-payload = bytearray()
-for r, g, b in base.getdata():
-    pixel = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-    payload += pixel.to_bytes(2, 'little')
-
 
 def tint_red(frame):
     out = bytearray(frame)
@@ -54,8 +44,25 @@ def tint_red(frame):
 with args.scene.open('rb') as f:
     if f.read(8) != b'DNPRS005' or struct.unpack('<IIII', f.read(16)) != (1200, 300, 128, 128):
         raise SystemExit(f'invalid scene asset {args.scene}')
-    if f.seek(BG_BYTES, 1) != 24 + BG_BYTES:
+    bg = np.frombuffer(f.read(BG_BYTES), dtype=np.uint8)
+    if bg.size != BG_BYTES:
         raise SystemExit('truncated scene asset')
+    bg = bg.reshape(4, 300, 1200, 3)
+
+    # Build the panic base from the tiled background alone. A preview frame
+    # contains the frozen final-pose head; embedding it here leaves a large
+    # prerendered face behind while the live mesh starts small and animates.
+    ys = np.arange(1080)
+    xs = np.arange(1920)
+    rows = (ys * 12 // 1080) % 4
+    sy = (ys * 12 * 300 // 1080) % 300
+    sx = (xs * 1200 // 480) % 1200
+    rgb = bg[rows[:, None], sy[:, None], sx[None, :]]
+    rgb565 = (((rgb[:, :, 0].astype(np.uint16) >> 3) << 11) |
+              ((rgb[:, :, 1].astype(np.uint16) >> 2) << 5) |
+              (rgb[:, :, 2].astype(np.uint16) >> 3)).astype('<u2')
+    payload = bytearray(rgb565.tobytes())
+
     stars = f.read(16 * SPRITE_BYTES)
     if len(stars) != 16 * SPRITE_BYTES:
         raise SystemExit('truncated star frames')

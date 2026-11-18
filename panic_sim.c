@@ -29,7 +29,9 @@ typedef int64_t s64;
 #define clamp(value, low, high) min(max(value, low), high)
 #define clamp_t(type, value, low, high) clamp((type)(value), (type)(low), (type)(high))
 #define DIV_ROUND_UP(value, divisor) (((value) + (divisor) - 1) / (divisor))
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof((array)[0]))
 #define div_s64(value, divisor) ((value) / (divisor))
+#define div64_u64(value, divisor) ((value) / (divisor))
 
 static u64 div64_u64_rem(u64 value, u64 divisor, u64 *remainder)
 {
@@ -59,6 +61,8 @@ static u64 int_sqrt64(u64 value)
 
 #define DNPR_WIDTH 1920U
 #define DNPR_HEIGHT 1080U
+#define DNPR_BAND_H 32U
+#define DNPR_BAND_COUNT DIV_ROUND_UP(DNPR_HEIGHT, DNPR_BAND_H)
 #define DNPR_BASE_BYTES ((size_t)DNPR_WIDTH * DNPR_HEIGHT * 2U)
 #define DNPR_SPRITE 128U
 #define DNPR_SPRITE_BYTES ((size_t)DNPR_SPRITE * DNPR_SPRITE * 4U)
@@ -121,6 +125,8 @@ struct drm_scanout_buffer {
 	const struct dnpr_format *format;
 	struct dnpr_map map[1];
 	void (*set_pixel)(struct drm_scanout_buffer *, unsigned int, unsigned int, u32);
+	void (*set_pixels)(struct drm_scanout_buffer *, unsigned int, unsigned int,
+			   const u32 *, unsigned int);
 };
 
 static u32 drm_draw_color_from_xrgb8888(u32 color, u32 format)
@@ -141,12 +147,21 @@ static u8 *dnpr_row;
 static u32 *dnpr_shared_frame;
 static u8 *dnpr_shared_dirty;
 static bool dnpr_shared_valid;
+static struct dnpr_rect dnpr_shared_rects[DNPR_MAX_SPRITES * 2 + 3];
+static unsigned int dnpr_shared_rect_count;
+static struct dnpr_sprite dnpr_shared_prev_sprites[DNPR_MAX_SPRITES];
+static unsigned int dnpr_shared_prev_sprite_count;
+static unsigned int dnpr_shared_prev_bar_w;
+static bool dnpr_shared_prev_valid;
 static u8 *dnpr_live_data;
 static u16 *dnpr_live_depth;
 static u16 *dnpr_live_owner;
 static u8 *dnpr_spec_lut;
 static struct dnpr_projected dnpr_projected[DNPR_LIVE_NV];
 static u16 dnpr_triangle_order[DNPR_LIVE_NT];
+static u16 dnpr_triangle_depths[DNPR_LIVE_NT];
+static u16 dnpr_band_triangles[DNPR_BAND_COUNT][DNPR_LIVE_NT];
+static u16 dnpr_band_triangle_count[DNPR_BAND_COUNT];
 static bool dnpr_unshaded;
 static bool dnpr_no_specular;
 #define DNPR_UNSHADED dnpr_unshaded
@@ -155,6 +170,7 @@ static u64 dnpr_last_pose_q = U64_MAX;
 static struct {
 	int x0, y0, x1, y1;
 } dnpr_head_bounds, dnpr_head_dirty;
+static bool dnpr_head_bounds_valid;
 
 #include "kernel/dnpr_raster_core.h"
 #include "kernel/dnpr_raster_rows.h"
